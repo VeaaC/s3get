@@ -2,7 +2,6 @@ use crossbeam::channel;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
-use rusoto_core::Region;
 use rusoto_s3::{GetObjectRequest, HeadObjectRequest, S3Client, S3};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -85,7 +84,7 @@ where
         let produce = produce.clone();
         tokio::spawn(async move {
             let data_sender = data_sender;
-            let client = S3Client::new(Region::EuWest1);
+            let client = S3Client::new(Default::default());
             while let Ok((i, item)) = iter_receiver.recv() {
                 let data = produce(client.clone(), item).await;
                 if data_sender.send((i, data)).is_err() {
@@ -155,7 +154,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         },
     };
 
-    let client = S3Client::new(Region::EuWest1);
+    let client = S3Client::new(Default::default());
     let head = client
         .head_object(HeadObjectRequest {
             bucket: bucket.clone(),
