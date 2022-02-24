@@ -917,6 +917,7 @@ dependencies = [
  "anyhow",
  "crossbeam",
  "futures",
+ "http",
  "num_cpus",
  "rusoto_core",
  "rusoto_s3",

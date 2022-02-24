@@ -1,5 +1,7 @@
 use crossbeam::channel;
 use futures::TryStreamExt;
+use http::StatusCode;
+use rusoto_core::RusotoError;
 use rusoto_s3::{GetObjectRequest, HeadObjectRequest, S3Client, S3};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -71,6 +73,49 @@ async fn download(
     Ok(result)
 }
 
+async fn region_and_size(
+    bucket: &str,
+    key: &str,
+    verbose: bool,
+) -> anyhow::Result<(rusoto_core::Region, i64)> {
+    let mut region: rusoto_core::Region = Default::default();
+    for _ in 0..3 {
+        let client = S3Client::new(region.clone());
+        let head = match client
+            .head_object(HeadObjectRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(x) => x,
+            Err(e) => {
+                if let RusotoError::Unknown(response) = &e {
+                    if response.status == StatusCode::MOVED_PERMANENTLY {
+                        if let Some(x) = response.headers.get("x-amz-bucket-region") {
+                            region = x.parse()?;
+                            if verbose {
+                                eprintln!("Redirected to {}", x);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                return Err(e.into());
+            }
+        };
+
+        let size = match head.content_length {
+            None => anyhow::bail!("Could not get content size"),
+            Some(x) => x,
+        };
+
+        return Ok((region, size));
+    }
+    anyhow::bail!("Stopped following redirects after 3 hops")
+}
+
 async fn run(args: &Args) -> anyhow::Result<()> {
     let (bucket, key) = match args.s3_path.strip_prefix("s3://") {
         None => anyhow::bail!("S3 path has to start with 's3://'"),
@@ -80,19 +125,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         },
     };
 
-    let client = S3Client::new(Default::default());
-    let head = client
-        .head_object(HeadObjectRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            ..Default::default()
-        })
-        .await?;
-
-    let size = match head.content_length {
-        None => anyhow::bail!("Could not get content size"),
-        Some(x) => x,
-    };
+    let (region, size) = region_and_size(&bucket, &key, args.verbose).await?;
 
     if args.verbose {
         eprintln!("Downloading {} bytes", size);
@@ -125,9 +158,10 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         let iter_receiver = iter_receiver.clone();
         let bucket = bucket.clone();
         let key = key.clone();
+        let region = region.clone();
         tokio::spawn(async move {
             let data_sender = data_sender;
-            let client = S3Client::new(Default::default());
+            let client = S3Client::new(region);
             while let Ok((i, (start, end))) = iter_receiver.recv() {
                 let data = download(&client, &bucket, &key, start, end).await;
                 if data_sender.send((i, data)).is_err() {
