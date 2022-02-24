@@ -1,8 +1,6 @@
 # S3Get
 
 [<img alt="build" src="https://img.shields.io/github/workflow/status/VeaaC/s3get/Shuffly%20CI/main?style=for-the-badge">](https://github.com/Veaac/s3get/actions?query=branch%3Amain)
-[<img alt="docs" src="https://img.shields.io/docsrs/s3get?style=for-the-badge">](https://crates.io/crates/s3get)
-[<img alt="package" src="https://img.shields.io/crates/v/s3get?style=for-the-badge">](https://docs.rs/s3get)
 
 Download a single file from S3 using parallel downloads.
 
