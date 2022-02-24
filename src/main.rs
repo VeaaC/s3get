@@ -1,6 +1,4 @@
 use crossbeam::channel;
-use futures::future;
-use futures::future::BoxFuture;
 use futures::TryStreamExt;
 use rusoto_s3::{GetObjectRequest, HeadObjectRequest, S3Client, S3};
 use std::cmp::Reverse;
@@ -45,78 +43,6 @@ struct Args {
     /// Print verbose information, statistics, etc
     #[structopt(long, short = "v")]
     verbose: bool,
-}
-
-fn parallel_process<Data, Iter, Item, Producer, Consumer>(
-    threads: usize,
-    iter: Iter,
-    produce: Producer,
-    mut consume: Consumer,
-) -> Result<(), anyhow::Error>
-where
-    Iter: Iterator<Item = Item> + Send + 'static,
-    Item: Send + 'static,
-    Producer: Clone + Fn(S3Client, Item) -> BoxFuture<'static, Data> + Send + Sync + 'static,
-    Data: Send + 'static,
-    Consumer: FnMut(Data) -> anyhow::Result<()> + Send + 'static,
-{
-    let num_tokens = 2 * threads;
-
-    let (token_sender, token_reciver) = channel::bounded(num_tokens);
-    let (iter_sender, iter_receiver) = channel::bounded(num_tokens);
-    let (data_sender, data_receiver) = channel::bounded(num_tokens);
-
-    tokio::spawn(future::lazy(move |_| {
-        for x in iter.enumerate() {
-            if token_reciver.recv().is_err() {
-                break;
-            }
-            if iter_sender.send(x).is_err() {
-                break;
-            }
-        }
-        std::mem::drop(iter_sender);
-    }));
-
-    for _ in 0..threads {
-        let data_sender = data_sender.clone();
-        let iter_receiver = iter_receiver.clone();
-        let produce = produce.clone();
-        tokio::spawn(async move {
-            let data_sender = data_sender;
-            let client = S3Client::new(Default::default());
-            while let Ok((i, item)) = iter_receiver.recv() {
-                let data = produce(client.clone(), item).await;
-                if data_sender.send((i, data)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(data_sender); // drop to make sure iteration will finish once all senders are out of scope
-
-    // we need to move these into the scope so they are dropped on failure
-    let token_sender = token_sender;
-    let data_receiver = data_receiver;
-    let mut pending = BTreeMap::new();
-    let mut next_idx = 0;
-    for _ in 0..num_tokens {
-        if token_sender.send(()).is_err() {
-            anyhow::bail!("Aborted during initialization");
-        }
-    }
-    for result in data_receiver {
-        pending.insert(Reverse(result.0), result.1);
-        while let Some(data) = pending.remove(&Reverse(next_idx)) {
-            if token_sender.send(()).is_err() {
-                // It's ok, we will just consume the remaining data
-            }
-
-            next_idx += 1;
-            consume(data)?;
-        }
-    }
-    Ok(())
 }
 
 async fn download(
@@ -184,22 +110,64 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         Box::new(std::io::stdout())
     };
 
-    let block_size = args.block_size;
-    parallel_process(
-        args.threads,
-        (0..size)
-            .step_by(args.block_size)
-            .map(move |start| (start, size.min(start + block_size as i64))),
-        move |client, (start, end)| {
-            let key = key.clone();
-            let bucket = bucket.clone();
-            Box::pin(async move { download(&client, &bucket, &key, start, end).await })
-        },
-        move |data: anyhow::Result<Vec<u8>>| -> anyhow::Result<()> {
-            output.write_all(&data?)?;
+    let num_tokens = 2 * args.threads;
+    let mut blocks = (0..size)
+        .step_by(args.block_size)
+        .map(move |start| (start, size.min(start + args.block_size as i64)))
+        .enumerate()
+        .fuse();
+
+    let (iter_sender, iter_receiver) = channel::bounded(num_tokens);
+    let (data_sender, data_receiver) = channel::bounded(num_tokens);
+
+    for _ in 0..args.threads {
+        let data_sender = data_sender.clone();
+        let iter_receiver = iter_receiver.clone();
+        let bucket = bucket.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let data_sender = data_sender;
+            let client = S3Client::new(Default::default());
+            while let Ok((i, (start, end))) = iter_receiver.recv() {
+                let data = download(&client, &bucket, &key, start, end).await;
+                if data_sender.send((i, data)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(data_sender); // drop to make sure iteration will finish once all senders are out of scope
+
+    let mut iter_sender = Some(iter_sender);
+    let mut request_next_block = move || match &iter_sender {
+        None => Ok(()),
+        Some(sender) => {
+            match blocks.next() {
+                None => {
+                    iter_sender = None;
+                }
+                Some(x) => {
+                    if sender.send(x).is_err() {
+                        anyhow::bail!("Aborted during communication");
+                    }
+                }
+            }
             Ok(())
-        },
-    )?;
+        }
+    };
+    let mut pending = BTreeMap::new();
+    let mut next_idx = 0;
+    for _ in 0..num_tokens {
+        request_next_block()?;
+    }
+    for result in data_receiver {
+        pending.insert(Reverse(result.0), result.1);
+        while let Some(data) = pending.remove(&Reverse(next_idx)) {
+            request_next_block()?;
+            next_idx += 1;
+            output.write_all(&data?)?;
+        }
+    }
 
     Ok(())
 }
