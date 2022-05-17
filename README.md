@@ -9,7 +9,7 @@ Download a single file from S3 using parallel downloads.
 Download a compressed archive and unpack it on the fly
 
 ```sh
-s3://my-bucket/my-key.tar.zstd -t 6 | pzstd -d | tar -xvf -
+s3get s3://my-bucket/my-key.tar.zstd -t 6 | pzstd -d | tar -xvf -
 ```
 
 ## Installation
