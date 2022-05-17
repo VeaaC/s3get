@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use structopt::StructOpt;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
@@ -45,6 +46,10 @@ struct Args {
     /// Print verbose information, statistics, etc
     #[structopt(long, short = "v")]
     verbose: bool,
+
+    /// Determines how often each chunk should be retried before giving up
+    #[structopt(long, default_value = "4")]
+    max_retries: u32,
 }
 
 async fn download(
@@ -159,11 +164,25 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         let bucket = bucket.clone();
         let key = key.clone();
         let region = region.clone();
+        let max_retries = args.max_retries;
         tokio::spawn(async move {
             let data_sender = data_sender;
             let client = S3Client::new(region);
             while let Ok((i, (start, end))) = iter_receiver.recv() {
-                let data = download(&client, &bucket, &key, start, end).await;
+                let mut retry_count = 0;
+                let data = loop {
+                    match download(&client, &bucket, &key, start, end).await {
+                        Err(e) => {
+                            retry_count += 1;
+                            if retry_count > max_retries {
+                                break Err(e);
+                            }
+                            eprintln!("Failed to download chunk: {}, retrying", e);
+                            tokio::time::sleep(Duration::from_secs(2_u64.pow(retry_count))).await;
+                        }
+                        Ok(x) => break Ok(x),
+                    }
+                };
                 if data_sender.send((i, data)).is_err() {
                     break;
                 }
@@ -212,6 +231,7 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads + 2) // we need 2 extra threads for blocking I/O
         .enable_io()
+        .enable_time()
         .build()
         .unwrap();
 
