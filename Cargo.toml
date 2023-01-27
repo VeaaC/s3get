@@ -1,6 +1,6 @@
 [package]
 name = "s3get"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 keywords = ["aws","s3"]
@@ -9,12 +9,12 @@ homepage = "https://github.com/VeaaC/s3get"
 repository = "https://github.com/VeaaC/s3get"
 
 [dependencies]
-structopt = "0.3.25"
-anyhow = "1.0.52"
-crossbeam = "0.8.1"
-rusoto_core = "0.47.0"
-rusoto_s3 = "0.47.0"
-futures = "0.3"
-num_cpus = "1.13.1"
-tokio = { version = "1.17.0", features = ["rt-multi-thread", "fs", "sync"] }
-http = "0.2.6"
+structopt = "0.3.26"
+anyhow = "1.0.68"
+crossbeam = "0.8.2"
+rusoto_core = "0.48.0"
+rusoto_s3 = "0.48.0"
+futures = "0.3.25"
+num_cpus = "1.15.0"
+tokio = { version = "1.24.2", features = ["rt-multi-thread", "fs", "sync"] }
+http = "0.2.8"
