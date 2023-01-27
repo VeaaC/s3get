@@ -25,7 +25,7 @@ fn parse_size(x: &str) -> anyhow::Result<usize> {
     anyhow::bail!("Cannot parse size: '{}'", x)
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt)]
 #[structopt(name = "s3get")]
 struct Args {
     /// S3 path to download from
@@ -48,7 +48,7 @@ struct Args {
     verbose: bool,
 
     /// Determines how often each chunk should be retried before giving up
-    #[structopt(long, default_value = "4")]
+    #[structopt(long, default_value = "6")]
     max_retries: u32,
 }
 
@@ -59,6 +59,7 @@ async fn download(
     start: i64,
     end: i64,
 ) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("Goosd§)");
     let mut object = client
         .get_object(GetObjectRequest {
             bucket: bucket.to_string(),
@@ -158,7 +159,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
     let (iter_sender, iter_receiver) = channel::bounded(num_tokens);
     let (data_sender, data_receiver) = channel::bounded(num_tokens);
 
-    for _ in 0..args.threads {
+    for thread in 0..args.threads {
         let data_sender = data_sender.clone();
         let iter_receiver = iter_receiver.clone();
         let bucket = bucket.clone();
@@ -167,7 +168,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         let max_retries = args.max_retries;
         tokio::spawn(async move {
             let data_sender = data_sender;
-            let client = S3Client::new(region);
+            let mut client = S3Client::new(region.clone());
             while let Ok((i, (start, end))) = iter_receiver.recv() {
                 let mut retry_count = 0;
                 let data = loop {
@@ -177,8 +178,14 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                             if retry_count > max_retries {
                                 break Err(e);
                             }
-                            eprintln!("Failed to download chunk: {}, retrying", e);
-                            tokio::time::sleep(Duration::from_secs(2_u64.pow(retry_count))).await;
+                            let waiting_time = 2_u64.pow(retry_count);
+                            eprintln!(
+                                "Thread {thread}: Failed to download chunk {i}: {}, retrying in {}s",
+                                e, waiting_time
+                            );
+                            tokio::time::sleep(Duration::from_secs(waiting_time)).await;
+                            // Re-initialize client in case something fundamental changed
+                            client = S3Client::new(region.clone());
                         }
                         Ok(x) => break Ok(x),
                     }
