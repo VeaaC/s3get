@@ -59,7 +59,6 @@ async fn download(
     start: i64,
     end: i64,
 ) -> anyhow::Result<Vec<u8>> {
-    anyhow::bail!("Goosd§)");
     let mut object = client
         .get_object(GetObjectRequest {
             bucket: bucket.to_string(),
