@@ -1,15 +1,13 @@
+use aws_sdk_s3 as s3;
+use clap::Parser;
 use crossbeam::channel;
-use futures::TryStreamExt;
 use http::StatusCode;
-use rusoto_core::RusotoError;
-use rusoto_s3::{GetObjectRequest, HeadObjectRequest, S3Client, S3};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use structopt::StructOpt;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
     let x = x.to_ascii_lowercase();
@@ -25,82 +23,84 @@ fn parse_size(x: &str) -> anyhow::Result<usize> {
     anyhow::bail!("Cannot parse size: '{}'", x)
 }
 
-#[derive(StructOpt)]
-#[structopt(name = "s3get")]
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
 struct Args {
     /// S3 path to download from
     s3_path: String,
 
-    /// output file name
-    #[structopt(long, short = "o")]
+    /// Output file name, print to stdout otherwise
+    #[arg(long, short)]
     output: Option<PathBuf>,
 
-    /// block size used for data downloads
-    #[structopt(long, default_value = "32MB", parse(try_from_str=parse_size))]
+    /// Block size used for data downloads
+    #[arg(long, default_value = "32MB", value_parser = parse_size)]
     block_size: usize,
 
-    /// number of threads to use, defaults to number of logical cores
-    #[structopt(long, short = "t", default_value = "6")]
+    /// Number of threads to use, defaults to number of logical cores
+    #[arg(long, short, default_value = "6")]
     threads: usize,
 
     /// Print verbose information, statistics, etc
-    #[structopt(long, short = "v")]
-    verbose: bool,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Determines how often each chunk should be retried before giving up
-    #[structopt(long, default_value = "6")]
+    #[arg(long, default_value = "6")]
     max_retries: u32,
 }
 
 async fn download(
-    client: &S3Client,
+    client: &s3::Client,
     bucket: &str,
     key: &str,
     start: i64,
     end: i64,
 ) -> anyhow::Result<Vec<u8>> {
     let mut object = client
-        .get_object(GetObjectRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            range: Some(format!("bytes={}-{}", start, end - 1)),
-            ..Default::default()
-        })
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(format!("bytes={}-{}", start, end - 1))
+        .send()
         .await?;
 
-    let mut body = object.body.take().expect("The object has no body");
-
     let mut result = Vec::new();
-    while let Some(chunk) = body.try_next().await? {
+    while let Some(chunk) = object.body.try_next().await? {
         result.extend(chunk);
     }
 
     Ok(result)
 }
 
-async fn region_and_size(
+async fn config_and_size(
     bucket: &str,
     key: &str,
-    verbose: bool,
-) -> anyhow::Result<(rusoto_core::Region, i64)> {
-    let mut region: rusoto_core::Region = Default::default();
+    verbose: u8,
+) -> anyhow::Result<(aws_config::SdkConfig, i64)> {
+    let config = aws_config::load_from_env().await;
+    let region = config.region().cloned();
+    let mut config = config
+        .into_builder()
+        .region(region.or_else(|| Some(s3::config::Region::new("us-east-2"))))
+        .build();
+
     for _ in 0..3 {
-        let client = S3Client::new(region.clone());
-        let head = match client
-            .head_object(HeadObjectRequest {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                ..Default::default()
-            })
-            .await
-        {
+        let client = s3::Client::new(&config);
+        let head = match client.head_object().bucket(bucket).key(key).send().await {
             Ok(x) => x,
             Err(e) => {
-                if let RusotoError::Unknown(response) = &e {
-                    if response.status == StatusCode::MOVED_PERMANENTLY {
-                        if let Some(x) = response.headers.get("x-amz-bucket-region") {
-                            region = x.parse()?;
-                            if verbose {
+                if verbose > 1 {
+                    eprintln!("{:?}", e);
+                }
+                if let s3::error::SdkError::ServiceError(response) = &e {
+                    if response.raw().status().as_u16() == StatusCode::MOVED_PERMANENTLY {
+                        if let Some(x) = response.raw().headers().get("x-amz-bucket-region") {
+                            config = config
+                                .into_builder()
+                                .region(Some(s3::config::Region::new(x.to_string())))
+                                .build();
+                            if verbose > 0 {
                                 eprintln!("Redirected to {}", x);
                             }
                             continue;
@@ -116,7 +116,7 @@ async fn region_and_size(
             Some(x) => x,
         };
 
-        return Ok((region, size));
+        return Ok((config, size));
     }
     anyhow::bail!("Stopped following redirects after 3 hops")
 }
@@ -130,9 +130,9 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         },
     };
 
-    let (region, size) = region_and_size(&bucket, &key, args.verbose).await?;
+    let (config, size) = config_and_size(&bucket, &key, args.verbose).await?;
 
-    if args.verbose {
+    if args.verbose > 0 {
         eprintln!("Downloading {} bytes", size);
     }
 
@@ -163,11 +163,11 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         let iter_receiver = iter_receiver.clone();
         let bucket = bucket.clone();
         let key = key.clone();
-        let region = region.clone();
         let max_retries = args.max_retries;
+        let config = config.clone();
         tokio::spawn(async move {
             let data_sender = data_sender;
-            let mut client = S3Client::new(region.clone());
+            let mut client = s3::Client::new(&config);
             while let Ok((i, (start, end))) = iter_receiver.recv() {
                 let mut retry_count = 0;
                 let data = loop {
@@ -184,7 +184,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                             );
                             tokio::time::sleep(Duration::from_secs(waiting_time)).await;
                             // Re-initialize client in case something fundamental changed
-                            client = S3Client::new(region.clone());
+                            client = s3::Client::new(&config);
                         }
                         Ok(x) => break Ok(x),
                     }
@@ -232,7 +232,7 @@ async fn run(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() {
-    let args = Args::from_args();
+    let args = Args::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads + 2) // we need 2 extra threads for blocking I/O
