@@ -1,6 +1,6 @@
 [package]
 name = "s3get"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 keywords = ["aws","s3"]
@@ -18,3 +18,4 @@ num_cpus = "1.16.0"
 tokio = { version = "1.36.0", features = ["rt-multi-thread", "fs", "sync"] }
 http = "1.0.0"
 clap = { version = "4.4.18", features = ["derive"] }
+time = "0.3.35"
