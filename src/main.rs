@@ -230,6 +230,33 @@ fn report_abandoned_errors(pending: &BTreeMap<usize, Result<Vec<u8>, anyhow::Err
     }
 }
 
+/// Splits `s3://bucket/key` into its two parts.
+fn parse_s3_path(path: &str) -> anyhow::Result<(String, String)> {
+    let rest = path
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("S3 path has to start with 's3://'"))?;
+    match rest.split_once('/') {
+        None => anyhow::bail!("S3 path should be 's3://bucket/key'"),
+        Some((bucket, key)) if bucket.is_empty() || key.is_empty() => {
+            anyhow::bail!("S3 path should be 's3://bucket/key'")
+        }
+        Some((bucket, key)) => Ok((bucket.to_string(), key.to_string())),
+    }
+}
+
+/// The half-open byte ranges the object is fetched in.
+fn block_ranges(size: i64, block_size: usize) -> impl Iterator<Item = (i64, i64)> {
+    (0..size)
+        .step_by(block_size)
+        .map(move |start| (start, size.min(start + block_size as i64)))
+}
+
+/// How many ranges `block_ranges` yields. Computed independently so that the
+/// completeness check does not depend on the iterator it is checking.
+fn block_count(size: i64, block_size: usize) -> usize {
+    (size as u64).div_ceil(block_size as u64) as usize
+}
+
 /// Why the download stopped.
 enum Completion {
     /// Every block was written.
@@ -518,13 +545,7 @@ async fn probe_object(bucket: &str, key: &str, verbose: u8) -> anyhow::Result<Ob
 /// consumer can park it indefinitely, and a runtime thread parked in a
 /// blocking call is a runtime thread that cannot service timers.
 fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> {
-    let (bucket, key) = match args.s3_path.strip_prefix("s3://") {
-        None => anyhow::bail!("S3 path has to start with 's3://'"),
-        Some(x) => match x.split_once('/') {
-            None => anyhow::bail!("S3 path should be 's3://bucket/key'"),
-            Some((bucket, key)) => (bucket.to_string(), key.to_string()),
-        },
-    };
+    let (bucket, key) = parse_s3_path(&args.s3_path)?;
 
     let ObjectInfo { config, size, etag } =
         rt.block_on(probe_object(&bucket, &key, args.verbose))?;
@@ -554,12 +575,8 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
 
     // Bounds how many blocks may be in flight, and so the peak memory.
     let num_tokens = (2 * args.threads).max(1);
-    let mut blocks = (0..size)
-        .step_by(args.block_size)
-        .map(move |start| (start, size.min(start + args.block_size as i64)))
-        .enumerate()
-        .fuse();
-    let total_blocks = (size as u64).div_ceil(args.block_size as u64) as usize;
+    let mut blocks = block_ranges(size, args.block_size).enumerate().fuse();
+    let total_blocks = block_count(size, args.block_size);
 
     let (iter_sender, iter_receiver) = mpsc::channel(num_tokens);
     let (data_sender, mut data_receiver) = mpsc::channel(num_tokens);
@@ -733,5 +750,170 @@ fn main() {
         // status is the one that matters in a pipeline, so say nothing.
         Ok(Completion::ConsumerClosed) => std::process::exit(0),
         Ok(Completion::Finished) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_accepts_every_unit_spelling() {
+        assert_eq!(parse_size("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("32MB").unwrap(), 32 * 1024 * 1024);
+        assert_eq!(parse_size("32mb").unwrap(), 32 * 1024 * 1024);
+        assert_eq!(parse_size("32M").unwrap(), 32 * 1024 * 1024);
+        assert_eq!(parse_size("512kb").unwrap(), 512 * 1024);
+        assert_eq!(parse_size("512k").unwrap(), 512 * 1024);
+        assert_eq!(parse_size("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1gb").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("4096b").unwrap(), 4096);
+    }
+
+    /// `gb` must not be read as a `b` suffix on the digits "2g", which would
+    /// then fail to parse as a number.
+    #[test]
+    fn parse_size_prefers_the_longest_unit() {
+        assert_eq!(parse_size("2gb").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("32kb").unwrap(), 32 * 1024);
+        assert_eq!(parse_size("32mb").unwrap(), 32 * 1024 * 1024);
+    }
+
+    /// A zero block size reaches `step_by`, which panics.
+    #[test]
+    fn parse_size_rejects_zero() {
+        for input in ["0", "0MB", "0kb", "0g"] {
+            assert!(parse_size(input).is_err(), "{input} should be rejected");
+        }
+    }
+
+    /// Without `checked_mul` this wraps and yields a small, plausible size.
+    #[test]
+    fn parse_size_rejects_overflow_instead_of_wrapping() {
+        assert!(parse_size("20000000000GB").is_err());
+        assert!(parse_size("99999999999999999999999").is_err());
+    }
+
+    /// Beyond this the i64 range arithmetic goes negative and the block buffer
+    /// allocation panics.
+    #[test]
+    fn parse_size_rejects_values_past_the_cap() {
+        assert!(parse_size("9223372036854775808").is_err());
+        assert!(parse_size("8589934592gb").is_err());
+        assert_eq!(parse_size("4gb").unwrap(), MAX_SIZE);
+    }
+
+    #[test]
+    fn parse_size_rejects_malformed_input() {
+        for input in ["", "  ", "abc", "1.5GB", "-5MB", "5tb", "mb", "b", "0x10"] {
+            assert!(parse_size(input).is_err(), "{input:?} should be rejected");
+        }
+    }
+
+    /// Zero workers download nothing at all.
+    #[test]
+    fn parse_threads_rejects_zero() {
+        assert!(parse_threads("0").is_err());
+        assert!(parse_threads("abc").is_err());
+        assert_eq!(parse_threads("6").unwrap(), 6);
+    }
+
+    #[test]
+    fn parse_s3_path_splits_bucket_from_key() {
+        let (bucket, key) = parse_s3_path("s3://my-bucket/my-key.tar").unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "my-key.tar");
+
+        // Keys legitimately contain slashes; only the first one separates.
+        let (bucket, key) = parse_s3_path("s3://b/a/nested/key").unwrap();
+        assert_eq!(bucket, "b");
+        assert_eq!(key, "a/nested/key");
+    }
+
+    #[test]
+    fn parse_s3_path_rejects_malformed_input() {
+        for input in [
+            "",
+            "my-bucket/key",
+            "http://b/k",
+            "s3://",
+            "s3://bucket",
+            "s3://bucket/",
+            "s3:///key",
+        ] {
+            assert!(
+                parse_s3_path(input).is_err(),
+                "{input:?} should be rejected"
+            );
+        }
+    }
+
+    /// The range header is inclusive, so the last byte of a block is `end - 1`;
+    /// an off-by-one here either drops or duplicates a byte per block.
+    #[test]
+    fn block_ranges_tile_the_object_exactly() {
+        for (size, block) in [
+            (0, 10),
+            (1, 10),
+            (9, 10),
+            (10, 10),
+            (11, 10),
+            (100, 10),
+            (101, 10),
+        ] {
+            let ranges: Vec<_> = block_ranges(size, block).collect();
+            assert_eq!(
+                ranges.len(),
+                block_count(size, block),
+                "count for {size}/{block}"
+            );
+
+            let mut expected_start = 0;
+            for (start, end) in &ranges {
+                assert_eq!(*start, expected_start, "gap or overlap at {size}/{block}");
+                assert!(end > start, "empty block at {size}/{block}");
+                expected_start = *end;
+            }
+            assert_eq!(expected_start, size, "ranges must cover the whole object");
+        }
+    }
+
+    #[test]
+    fn block_count_handles_edges() {
+        assert_eq!(block_count(0, 32), 0);
+        assert_eq!(block_count(1, 32), 1);
+        assert_eq!(block_count(32, 32), 1);
+        assert_eq!(block_count(33, 32), 2);
+    }
+
+    /// An uncapped backoff schedules a wake-up years out; an unchecked `pow`
+    /// overflows outright.
+    #[test]
+    fn backoff_is_bounded_at_every_retry_count() {
+        for retry in [1u32, 2, 6, 20, 63, 64, u32::MAX] {
+            let delay = backoff_seconds(retry);
+            assert!(delay <= MAX_BACKOFF_SECS, "retry {retry} gave {delay}s");
+        }
+        // Growth is still exponential early on.
+        assert!(backoff_seconds(1) <= 2);
+        assert!(backoff_seconds(6) >= MAX_BACKOFF_SECS / 2);
+    }
+
+    /// Exiting 0 on a closed pipe must never apply to an explicit --output.
+    #[test]
+    fn closed_consumer_is_stdout_only() {
+        let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let other = std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+
+        let stdout = Output::Stdout(std::io::stdout().lock());
+        assert!(stdout.is_closed_consumer(&broken));
+        assert!(!stdout.is_closed_consumer(&other));
+
+        let dir = std::env::temp_dir().join(format!("s3get-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = Output::File(FileOutput::create(&dir.join("out.bin")).unwrap());
+        assert!(!file.is_closed_consumer(&broken));
+        drop(file);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
