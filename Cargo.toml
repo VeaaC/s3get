@@ -2,20 +2,35 @@
 name = "s3get"
 version = "0.4.1"
 edition = "2021"
+rust-version = "1.94.1"
 license = "MIT"
 keywords = ["aws","s3"]
+categories = ["command-line-utilities"]
 description = "Download a single file from S3 using chunks"
 homepage = "https://github.com/VeaaC/s3get"
 repository = "https://github.com/VeaaC/s3get"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.79"
-crossbeam = "0.8.4"
-aws-config = { version = "1.1.4", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.14.0"
-futures = "0.3.30"
-num_cpus = "1.16.0"
-tokio = { version = "1.36.0", features = ["rt-multi-thread", "fs", "sync"] }
-http = "1.0.0"
+aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
+# All default features except `rustls`, a legacy-compat flag that pulls in a
+# second TLS/HTTP stack (hyper 0.14, h2 0.3, rustls 0.21) alongside the one
+# `default-https-client` already provides. Dropping it removes ten crates and
+# an unmaintained rustls line.
+aws-sdk-s3 = { version = "1.141.0", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
+# "net" for Builder::enable_io, "time" for enable_time and sleep/timeout,
+# "sync" for the mpsc work queue. Declared explicitly rather than relying on
+# another crate's feature selection to supply them.
+tokio = { version = "1.36.0", features = [
+    "rt-multi-thread",
+    "time",
+    "net",
+    "sync",
+] }
 clap = { version = "4.4.18", features = ["derive"] }
-time = "0.3.35"

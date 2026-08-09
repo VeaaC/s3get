@@ -1,0 +1,5 @@
+[toolchain]
+# The aws-sdk-* stack needs a newer compiler than the rust-version floor in
+# Cargo.toml. Tracking stable keeps the build working on machines whose global
+# rustup default is an older pinned toolchain.
+channel = "stable"
