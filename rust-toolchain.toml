@@ -1,0 +1,6 @@
+[toolchain]
+# The aws-sdk-* stack requires a newer compiler than this repo's MSRV floor
+# (see `rust-version` in Cargo.toml). Pinned to the `stable` channel so a
+# machine whose global rustup default is an older pinned toolchain still
+# builds this project correctly.
+channel = "stable"

@@ -2,6 +2,7 @@
 name = "s3get"
 version = "0.4.1"
 edition = "2021"
+rust-version = "1.94.1"
 license = "MIT"
 keywords = ["aws","s3"]
 description = "Download a single file from S3 using chunks"
