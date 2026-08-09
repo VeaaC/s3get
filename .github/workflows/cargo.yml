@@ -12,8 +12,41 @@ jobs:
   Build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --all-targets
       - name: Run tests
         run: cargo test --all-targets
+      - name: Build release
+        run: cargo build --release
+
+  # Guards the `rust-version` floor in Cargo.toml, which the stable job above
+  # cannot check.
+  MSRV:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins the stable channel for day-to-day work; this
+      # job deliberately builds with the declared minimum instead.
+      - name: Remove toolchain override
+        run: rm -f rust-toolchain.toml
+      - name: Build
+        run: cargo build --all-targets
+
+  Audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
