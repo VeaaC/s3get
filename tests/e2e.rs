@@ -238,3 +238,57 @@ fn bounds_a_stalled_response() {
         started.elapsed()
     );
 }
+
+/// Regression test for the silent-truncation bug: a write failure on the final
+/// bytes must not be discarded. `/dev/full` fails at write(2), so this covers
+/// both the write path and the explicit flush.
+#[test]
+fn a_failing_output_device_is_not_reported_as_success() {
+    let stub = stub_or_skip!();
+
+    let status = s3get(&stub)
+        .args(["s3://b/ok", "--block-size", "512kb", "-o", "/dev/full"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "-o /dev/full must not exit 0");
+
+    let out = s3get(&stub)
+        .args(["s3://b/ok", "--block-size", "512kb"])
+        .stdout(std::fs::File::create("/dev/full").unwrap())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "stdout to /dev/full must not exit 0");
+}
+
+/// The completeness check is what stops a torn-down download from looking like
+/// a finished one. A permanently failing chunk must never exit 0, and must
+/// never leave a destination file behind.
+#[test]
+fn an_incomplete_download_never_exits_zero() {
+    let stub = stub_or_skip!();
+    let dir = std::env::temp_dir().join(format!("s3get-incomplete-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("out.bin");
+
+    let out = s3get(&stub)
+        .args(["s3://b/precon", "--block-size", "256kb", "-t", "4", "-o"])
+        .arg(&target)
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "a failed download must not exit 0");
+    assert!(
+        !target.exists(),
+        "a failed download must not leave a destination file"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".part"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}

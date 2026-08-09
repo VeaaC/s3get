@@ -9,13 +9,15 @@ Modes (per-request, chosen by the key name):
   /b/precon    -- answers ranged GETs with 412 (simulates a changed object)
 """
 import hashlib
+import random
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SIZE = 5 * 1024 * 1024 + 12345  # deliberately not a block multiple
-BLOB = bytes((i * 7 + (i >> 8) * 13) & 0xFF for i in range(SIZE))
+_RNG = random.Random(20260809)
+BLOB = bytes(_RNG.getrandbits(8) for i in range(SIZE))
 ETAG = '"%s"' % hashlib.md5(BLOB).hexdigest()
 served_short = set()
 

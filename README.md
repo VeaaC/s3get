@@ -43,42 +43,51 @@ Requires Rust 1.94.1 or newer.
 | `--stall-timeout <SECS>` | `30` | Give up on a chunk and retry it if no data arrives for this long. Bounds connections that establish and then go quiet, which report no error of their own. |
 | `-v`, `--verbose` | off | Print progress information. Repeat (`-vv`) for full error detail. |
 
-Peak memory is roughly `2 * threads * block-size` — about 384MB at the
-defaults. `-t 32 --block-size 128MB` would ask for 8GB.
+Peak memory is roughly `2 * threads * block-size`, so about 384MB at the
+defaults. `-t 32 --block-size 128MB` asks for 8GB.
 
 ## Credentials and region
 
 Credentials and region are resolved by the AWS SDK in its standard order:
 environment variables, then the shared config and credentials files, then
-container and instance metadata. If no region is configured, `us-east-2` is
-assumed; if the bucket lives elsewhere, S3's redirect is followed
-automatically.
+container and instance metadata. Without a configured region `us-east-2` is
+assumed, and S3's redirect to the bucket's actual region is followed.
 
 `AWS_ENDPOINT_URL` / `AWS_ENDPOINT_URL_S3` are honoured, which is useful for
 S3-compatible stores, and so are `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`.
 
+If no credential source responds (no environment variables, no config file,
+unreachable instance metadata) the SDK takes about 20 seconds to give up.
+
 ## Integrity
 
-Every chunk is requested with `If-Match` against the ETag reported when the
-download started, so an object replaced mid-transfer fails with a precondition
-error rather than yielding a file spliced from two versions. Each chunk is
-checked against its expected length, and the run fails unless every block was
-written. If the object reports no ETag, version pinning is unavailable and a
-warning is printed.
+Every chunk is requested with `If-Match` against the ETag read at the start,
+so an object replaced mid-transfer fails with a precondition error instead of
+producing a file spliced from two versions. Each chunk is checked against its
+expected length, and the run fails unless every block was written. If the
+object reports no ETag there is nothing to pin to, and a warning is printed.
 
-SDK-side response checksum validation is disabled deliberately: it has no
-notion of ranged requests, and every request this tool makes is a range.
+SDK-side response checksum validation is disabled on purpose: it has no notion
+of ranged requests, and every request here is a range.
 
-## Behaviour worth knowing
+## Behaviour notes
 
-- **Piping to a consumer that exits early** — `s3get ... | head` exits 0
-  silently. The reader's status is what matters in a pipeline. Any chunk
-  errors already collected are reported as warnings first.
-- **`--output` is staged** — the download is written to a hidden sibling file
-  and renamed into place once complete, so an interrupted run never leaves a
-  truncated file that looks finished. A run killed by a signal leaves a
-  `.<name>.s3get-<id>.part` file behind, which is safe to delete.
-- Staging applies only when the destination is a regular file. `/dev/null`, a
-  FIFO, a device node or a symlink is written through directly.
-- Replacing an existing file swaps in a new inode, so its mode is preserved but
-  ACLs, extended attributes and hard links are not.
+- `s3get ... | head` exits 0 silently. The reader's status is what matters in
+  a pipeline. Chunk errors collected before that point are printed as
+  warnings. This waives the all-or-nothing guarantee for that case:
+  `s3get ... | true` also exits 0, having written nothing.
+- `--output` is held to the stricter rule, so `s3get ... -o /dev/stdout | head`
+  exits non-zero where the plain pipe form exits 0.
+- `--output` is staged: the download goes to a hidden sibling file and is
+  renamed into place once complete, so an interrupted run leaves no truncated
+  file at the destination. A run killed by a signal leaves a
+  `.<name>.s3get-<id>.part` file, which is safe to delete.
+- Staging applies only to regular files. `/dev/null`, FIFOs, device nodes and
+  symlinks are written through directly. If the sibling cannot be created (a
+  read-only directory, or a name too long with the suffix) the download falls
+  back to writing in place and warns on stderr; that run can leave a partial
+  file.
+- Replacing a file swaps in a new inode. The mode is preserved; ACLs, extended
+  attributes and hard links are not, and a privileged run becomes the owner.
+- Retry diagnostics are best-effort. If stderr is not being read, messages are
+  dropped rather than stalling the download.

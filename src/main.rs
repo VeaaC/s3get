@@ -11,20 +11,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-/// S3 answers a request aimed at the wrong region with a permanent redirect
-/// carrying an `x-amz-bucket-region` header.
+/// S3 redirects a request aimed at the wrong region, naming the right one in
+/// the `x-amz-bucket-region` header.
 ///
-/// Defined here so the crate needs no dependency on `http`, whose major
-/// version would have to track the one vendored inside the smithy runtime.
+/// Defined locally to avoid a dependency on `http`, whose major version would
+/// then have to match the copy vendored in the smithy runtime.
 const HTTP_MOVED_PERMANENTLY: u16 = 301;
 
-/// Ceiling on retry backoff, so a large `--max-retries` cannot schedule a
-/// wake-up years away.
+/// Upper bound on retry backoff. Uncapped, a high `--max-retries` schedules
+/// sleeps measured in days.
 const MAX_BACKOFF_SECS: u64 = 60;
 
-/// Error codes S3 returns for conditions that clear on their own. Status alone
-/// is not enough to recognise them: `RequestTimeout` arrives as an HTTP 400,
-/// which is otherwise the signature of a request that will never succeed.
+/// Transient S3 error codes. Status alone does not identify them:
+/// `RequestTimeout` comes back as HTTP 400, which is otherwise permanent.
 const RETRYABLE_ERROR_CODES: &[&str] = &[
     "BandwidthLimitExceeded",
     "InternalError",
@@ -39,8 +38,8 @@ const RETRYABLE_ERROR_CODES: &[&str] = &[
     "ThrottlingException",
 ];
 
-/// Delay before the `retry_count`-th retry: exponential growth, capped, with
-/// equal jitter so that workers failing together do not return in lockstep.
+/// Exponential backoff with equal jitter, capped at `MAX_BACKOFF_SECS`. The
+/// jitter keeps workers that fail together from retrying in lockstep.
 fn backoff_seconds(retry_count: u32) -> u64 {
     let capped = 2_u64.saturating_pow(retry_count).min(MAX_BACKOFF_SECS);
     let half = capped / 2;
@@ -53,22 +52,21 @@ fn backoff_seconds(retry_count: u32) -> u64 {
 
 /// A `--output` destination.
 ///
-/// When the destination is a regular file the bytes are staged in a sibling
-/// temp file and renamed into place once the download is complete, so an
-/// interrupted run never leaves a partial file that looks finished. Anything
-/// else -- `/dev/null`, a FIFO, a device node -- is written straight through,
-/// since renaming over it would replace the thing the user pointed at.
+/// A regular file is staged in a sibling temp file and renamed on success, so
+/// an aborted run leaves nothing partial at the destination. Other targets
+/// (`/dev/null`, FIFOs, device nodes) are written directly, since renaming
+/// over them would replace them.
 struct FileOutput {
     file: std::fs::File,
-    /// The staging path, taken on success and removed on drop.
+    /// Set while staging. Cleared after the rename, removed on drop.
     temp_path: Option<PathBuf>,
     destination: PathBuf,
 }
 
 impl FileOutput {
     fn create(destination: &Path) -> std::io::Result<Self> {
-        // `symlink_metadata` does not follow links, so a symlink is written
-        // through rather than replaced by the rename.
+        // symlink_metadata does not follow links, so a symlink is written
+        // through instead of being replaced by the rename.
         let stage = match std::fs::symlink_metadata(destination) {
             Ok(metadata) => metadata.is_file(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -79,11 +77,19 @@ impl FileOutput {
             return Self::in_place(destination);
         }
 
-        // Staging needs to create a sibling, which write access to the
-        // destination does not imply, and whose longer name can exceed the
-        // filesystem limit. Writing in place still works in both cases and is
-        // no worse than not staging at all.
-        Self::staged(destination).or_else(|_| Self::in_place(destination))
+        // Creating a sibling needs write access to the directory, which
+        // write access to the destination does not imply, and the longer name
+        // can exceed NAME_MAX. Writing in place works in both cases but gives
+        // up the abort guarantee, so warn rather than degrade silently.
+        Self::staged(destination).or_else(|e| {
+            eprintln!(
+                "Warning: cannot stage alongside {}: {}. Writing in place, so an \
+                 interrupted download will leave a partial file.",
+                destination.display(),
+                e
+            );
+            Self::in_place(destination)
+        })
     }
 
     fn in_place(destination: &Path) -> std::io::Result<Self> {
@@ -100,16 +106,15 @@ impl FileOutput {
             .unwrap_or_default()
             .to_string_lossy();
 
-        // `create_new` refuses to open anything that already exists, symlink
-        // included, so a name guessed by another user in a shared directory
-        // cannot redirect the download. The suffix is randomised so that
-        // repeated guessing cannot keep winning the race either.
+        // create_new fails on anything that already exists, symlinks
+        // included, so a planted name in a shared directory cannot redirect
+        // the write. The random suffix makes guessing impractical as well.
         let mut last_error = None;
         for _ in 0..16 {
             let suffix = std::collections::hash_map::RandomState::new()
                 .build_hasher()
                 .finish();
-            // A sibling, so the rename stays on one filesystem.
+            // Sibling path keeps the rename on one filesystem.
             let temp_path = destination.with_file_name(format!(".{name}.s3get-{suffix:x}.part"));
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -117,10 +122,10 @@ impl FileOutput {
                 .open(&temp_path)
             {
                 Ok(file) => {
-                    // A fresh file would otherwise take the umask default and
-                    // quietly widen the mode of the file being replaced. Only
-                    // the mode bits carry over: ACLs, xattrs and hard links
-                    // belong to the old inode and do not survive a rename.
+                    // Without this the new file takes the umask default and
+                    // can widen the mode of the file being replaced. Only mode
+                    // bits carry over; ACLs, xattrs and hard links belong to
+                    // the old inode.
                     if let Ok(metadata) = std::fs::metadata(destination) {
                         let _ = file.set_permissions(metadata.permissions());
                     }
@@ -145,8 +150,8 @@ impl FileOutput {
 
 impl Drop for FileOutput {
     fn drop(&mut self) {
-        // Still present means `finish` never ran, so the download did not
-        // complete and the staged bytes are worthless.
+        // Still set means finish() never ran, so the staged bytes are
+        // incomplete.
         if let Some(temp_path) = &self.temp_path {
             let _ = std::fs::remove_file(temp_path);
         }
@@ -155,8 +160,8 @@ impl Drop for FileOutput {
 
 /// Where downloaded blocks are written.
 ///
-/// The stdout handle is locked once and held: it is the only writer, and
-/// re-acquiring the lock per block is wasted work on a hot path.
+/// The stdout lock is taken once and held. Nothing else writes to it, and
+/// re-locking per block is pure overhead.
 enum Output {
     File(FileOutput),
     Stdout(std::io::StdoutLock<'static>),
@@ -179,24 +184,22 @@ impl Write for Output {
 }
 
 impl Output {
-    /// Completes the write, surfacing errors that are otherwise discarded.
+    /// Completes the write and reports errors that would otherwise be lost.
     ///
-    /// A file's `flush` is a no-op and the result of its `close` is dropped
-    /// along with the handle, so on a filesystem that defers error reporting --
-    /// NFS, or a quota hit under delayed allocation -- `sync_all` is what turns
-    /// a failed write into a failed exit.
+    /// `File::flush` is a no-op and the close result is discarded on drop, so
+    /// filesystems that defer errors to close (NFS, or a quota hit under
+    /// delayed allocation) need the `sync_all` to fail the run.
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()?;
         if let Output::File(out) = self {
-            // Only a regular file can hold a write back long enough to fail at
-            // close. A FIFO, socket or character device has nothing to sync and
-            // answers `fsync` with EINVAL, which would turn `-o /dev/null` and
-            // `-o <fifo>` into failures despite every byte arriving.
+            // Only regular files defer errors to close. fsync on a FIFO,
+            // socket or character device returns EINVAL, which would fail
+            // `-o /dev/null` and `-o <fifo>` after a correct download.
             if out.file.metadata()?.is_file() {
                 out.file.sync_all()?;
             }
-            // Cleared only once the rename has succeeded, so a failure here
-            // still leaves `Drop` armed to remove the staging file.
+            // Cleared only after the rename succeeds, so a failure here
+            // leaves Drop armed to remove the staging file.
             if let Some(temp_path) = out.temp_path.as_ref() {
                 std::fs::rename(temp_path, &out.destination)?;
                 out.temp_path = None;
@@ -205,20 +208,18 @@ impl Output {
         Ok(())
     }
 
-    /// Whether an error means the reader on the other end of a pipe has gone
-    /// away, which for `s3get s3://... | head` is ordinary usage rather than a
-    /// failure. Only ever true for stdout: the same error against `--output`
-    /// is a genuine write failure and must stay fatal.
+    /// Whether the reader on the other end of the pipe has gone away, as in
+    /// `s3get s3://... | head`. Restricted to stdout: the same error against
+    /// `--output` is a real write failure and stays fatal.
     fn is_closed_consumer(&self, e: &std::io::Error) -> bool {
         matches!(self, Output::Stdout(_)) && e.kind() == std::io::ErrorKind::BrokenPipe
     }
 }
 
-/// Reports download failures for blocks that were fetched but never written.
+/// Reports failures for blocks that were fetched but never written.
 ///
-/// Leaving with a closed consumer is a success, so these errors never reach the
-/// exit code. They are still worth saying out loud: a 412 here means the object
-/// was replaced mid-download, and that would otherwise vanish entirely.
+/// A closed consumer exits 0, so these never reach the exit code. They are
+/// still worth printing: a 412 here means the object was replaced mid-download.
 fn report_abandoned_errors(pending: &BTreeMap<usize, Result<Vec<u8>, anyhow::Error>>) {
     for (idx, outcome) in pending {
         if let Err(e) = outcome {
@@ -251,8 +252,8 @@ fn block_ranges(size: i64, block_size: usize) -> impl Iterator<Item = (i64, i64)
         .map(move |start| (start, size.min(start + block_size as i64)))
 }
 
-/// How many ranges `block_ranges` yields. Computed independently so that the
-/// completeness check does not depend on the iterator it is checking.
+/// How many ranges `block_ranges` yields. Computed independently so the
+/// completeness check does not depend on the iterator it validates.
 fn block_count(size: i64, block_size: usize) -> usize {
     (size as u64).div_ceil(block_size as u64) as usize
 }
@@ -261,8 +262,35 @@ fn block_count(size: i64, block_size: usize) -> usize {
 enum Completion {
     /// Every block was written.
     Finished,
-    /// The process reading our stdout closed the pipe first.
+    /// The process reading stdout closed the pipe first.
     ConsumerClosed,
+}
+
+/// Carries worker diagnostics to a dedicated thread.
+///
+/// Writing to stderr blocks. If the reader stops draining, a worker doing it
+/// inline parks inside its own poll, where neither cancellation nor the stall
+/// timeout can reach it. Reporting is best-effort: messages are dropped rather
+/// than allowed to hold up the download.
+#[derive(Clone)]
+struct Diagnostics(std::sync::mpsc::SyncSender<String>);
+
+impl Diagnostics {
+    fn spawn() -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(256);
+        // Detached, so the process can exit while this thread is still
+        // parked in a write that never returns.
+        std::thread::spawn(move || {
+            for message in receiver {
+                eprintln!("{message}");
+            }
+        });
+        Self(sender)
+    }
+
+    fn report(&self, message: String) {
+        let _ = self.0.try_send(message);
+    }
 }
 
 /// A failed download attempt, carrying whether another attempt could succeed.
@@ -280,8 +308,8 @@ impl AttemptError {
     }
 }
 
-/// Upper bound on a parsed size. Far above any useful block size, and low
-/// enough that block offsets stay well inside `i64`.
+/// Upper bound on a parsed size. Above any useful block size, and low enough
+/// that block offsets stay inside `i64`.
 const MAX_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 /// Byte-count units, longest suffix first so that `gb` is not read as `b`.
@@ -319,9 +347,8 @@ fn parse_size(x: &str) -> anyhow::Result<usize> {
         .checked_mul(unit)
         .ok_or_else(|| anyhow::anyhow!("Size '{x}' is too large to represent"))?;
 
-    // Blocks are addressed as i64 byte offsets and buffered whole, so an
-    // unbounded value would wrap the range arithmetic negative and then ask for
-    // an impossible allocation.
+    // Offsets are i64 and blocks are buffered whole, so an unbounded value
+    // wraps the range arithmetic negative and then asks for a huge allocation.
     if size > MAX_SIZE {
         anyhow::bail!("Size '{x}' exceeds the {MAX_SIZE}-byte maximum");
     }
@@ -329,13 +356,20 @@ fn parse_size(x: &str) -> anyhow::Result<usize> {
     Ok(size)
 }
 
-/// Rejects a concurrency of zero, which would spawn no workers and download
-/// nothing.
+/// Largest accepted concurrency. Past the point of diminishing returns, and
+/// low enough that the channel capacity stays inside tokio's limits.
+const MAX_THREADS: usize = 1024;
+
+/// Rejects zero, which spawns no workers, and values large enough to exhaust
+/// the runtime instead of the network.
 fn parse_threads(x: &str) -> anyhow::Result<usize> {
     let value = usize::from_str(x.trim())
         .map_err(|_| anyhow::anyhow!("Cannot parse thread count '{x}'"))?;
     if value == 0 {
         anyhow::bail!("At least one thread is required");
+    }
+    if value > MAX_THREADS {
+        anyhow::bail!("At most {MAX_THREADS} threads are supported, got {value}");
     }
     Ok(value)
 }
@@ -377,13 +411,13 @@ struct Args {
 
 /// Fetches the half-open byte range `start..end` of an object.
 ///
-/// `etag` pins the request to one specific version of the object: if it is
-/// replaced while a download is in flight, S3 answers 412 instead of serving
-/// bytes that would be spliced together with blocks from the previous version.
+/// `etag` pins the request to one version. If the object is replaced mid
+/// download S3 answers 412, rather than serving bytes that would be spliced
+/// together with blocks from the previous version.
 ///
-/// `stall_timeout` bounds the wait for the response and for each subsequent
-/// body chunk. A connection that establishes and then goes quiet produces no
-/// error of its own, so without this the block would never complete.
+/// `stall_timeout` bounds the wait for the response and for each body chunk. A
+/// connection that establishes and then goes quiet reports no error of its
+/// own, so without this the block never completes.
 async fn download(
     client: &s3::Client,
     bucket: &str,
@@ -410,9 +444,9 @@ async fn download(
         }
         Ok(Err(e)) => {
             let retryable = match &e {
-                // 412 lands here when `if_match` fails, i.e. the object was
-                // replaced. Retrying cannot recover the version we started
-                // with, so it is deliberately terminal, as are 403 and 404.
+                // A failed if_match arrives here as 412. Retrying cannot
+                // bring back the version we started with, so it is terminal,
+                // as are 403 and 404.
                 SdkError::ServiceError(context) => {
                     let status = context.raw().status().as_u16();
                     let code = context.err().code().unwrap_or_default();
@@ -421,14 +455,14 @@ async fn download(
                         || (500..600).contains(&status)
                         || RETRYABLE_ERROR_CODES.contains(&code)
                 }
-                // `is_user` covers requests the client itself could not form.
-                // Connection, DNS and TLS failures are reported as io/other and
-                // stay retryable, since they are usually transient.
+                // is_user covers requests the client could not form.
+                // Connection, DNS and TLS failures come back as io/other and
+                // stay retryable.
                 SdkError::DispatchFailure(failure) => !failure.is_user(),
                 SdkError::ConstructionFailure(_) => false,
-                // `SdkError` is non-exhaustive. An unrecognised failure is
-                // treated as transient: a needless retry costs a delay, while
-                // wrongly giving up abandons the whole download.
+                // SdkError is non-exhaustive. Unknown failures are treated as
+                // transient: a wasted retry costs a delay, giving up wrongly
+                // abandons the download.
                 _ => true,
             };
             return Err(AttemptError {
@@ -440,8 +474,7 @@ async fn download(
     };
 
     let expected = (end - start) as usize;
-    // The exact size is known, so the buffer is allocated once rather than
-    // grown and copied repeatedly across a block.
+    // The size is known, so allocate once instead of growing and copying.
     let mut result = Vec::with_capacity(expected);
     loop {
         let chunk = match tokio::time::timeout(stall_timeout, object.body.try_next()).await {
@@ -473,9 +506,9 @@ async fn download(
     Ok(result)
 }
 
-/// What a successful `HeadObject` tells us: the config that reached the
-/// object (possibly after a region redirect), its length, and the version tag
-/// every subsequent ranged request is pinned to.
+/// Result of a successful `HeadObject`: the config that reached the object
+/// (possibly after a region redirect), its length, and the version tag the
+/// ranged requests are pinned to.
 struct ObjectInfo {
     config: aws_config::SdkConfig,
     size: i64,
@@ -488,13 +521,12 @@ async fn probe_object(bucket: &str, key: &str, verbose: u8) -> anyhow::Result<Ob
     let mut config = config
         .into_builder()
         .region(region.or_else(|| Some(s3::config::Region::new("us-east-2"))))
-        // `WhenSupported` asks S3 for a checksum and validates the body
+        // WhenSupported asks S3 for a checksum and validates the body
         // against it, but the validator has no notion of ranged requests and
-        // every request here is a range. Its only guard is spotting the `-N`
-        // suffix of a composite multipart checksum, which S3 need not include
-        // on a partial response, so a whole-object checksum can end up
-        // compared against a single block. Integrity comes from TLS and the
-        // per-block length check in `download`.
+        // every request here is a range. Its only guard is the "-N" suffix of
+        // a composite multipart checksum, which S3 need not send on a partial
+        // response, so a whole-object checksum can end up compared against one
+        // block. Integrity comes from TLS and the length check in download().
         .response_checksum_validation(s3::config::ResponseChecksumValidation::WhenRequired)
         .build();
 
@@ -540,10 +572,9 @@ async fn probe_object(bucket: &str, key: &str, verbose: u8) -> anyhow::Result<Ob
 
 /// Drives the download.
 ///
-/// Only the setup is asynchronous. The ordering loop runs on this thread,
-/// outside the runtime, because it makes blocking calls -- a write to a slow
-/// consumer can park it indefinitely, and a runtime thread parked in a
-/// blocking call is a runtime thread that cannot service timers.
+/// Only the setup is async. The ordering loop runs on this thread, outside the
+/// runtime, because it blocks: a write to a slow consumer can park it for a
+/// long time, and a parked runtime thread stops servicing timers.
 fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> {
     let (bucket, key) = parse_s3_path(&args.s3_path)?;
 
@@ -573,20 +604,21 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
         None => Output::Stdout(std::io::stdout().lock()),
     };
 
-    // Bounds how many blocks may be in flight, and so the peak memory.
+    let diagnostics = Diagnostics::spawn();
+
+    // Bounds blocks in flight, and so peak memory.
     let num_tokens = (2 * args.threads).max(1);
     let mut blocks = block_ranges(size, args.block_size).enumerate().fuse();
     let total_blocks = block_count(size, args.block_size);
 
     let (iter_sender, iter_receiver) = mpsc::channel(num_tokens);
     let (data_sender, mut data_receiver) = mpsc::channel(num_tokens);
-    // The work queue has many consumers, which an mpsc receiver does not allow
-    // on its own. The lock is held only across taking an item, never across a
-    // download.
+    // An mpsc receiver has a single consumer, so the workers share it behind
+    // a lock. Held only while taking an item, never across a download.
     let iter_receiver = Arc::new(tokio::sync::Mutex::new(iter_receiver));
 
-    // Spawning requires a runtime context, which this thread is otherwise
-    // outside of. Dropped before the blocking ordering loop begins.
+    // Spawning needs a runtime context; this thread is otherwise outside one.
+    // Dropped before the blocking ordering loop starts.
     let spawn_guard = rt.enter();
 
     let mut workers = JoinSet::new();
@@ -598,6 +630,7 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
         let etag = etag.clone();
         let max_retries = args.max_retries;
         let config = config.clone();
+        let diagnostics = diagnostics.clone();
         workers.spawn(async move {
             let data_sender = data_sender;
             let mut client = s3::Client::new(&config);
@@ -627,10 +660,10 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
                                 break Err(e.source);
                             }
                             let waiting_time = backoff_seconds(retry_count);
-                            eprintln!(
+                            diagnostics.report(format!(
                                 "Thread {thread}: Failed to download chunk {i}: {}, retrying in {}s",
                                 e.source, waiting_time
-                            );
+                            ));
                             tokio::time::sleep(Duration::from_secs(waiting_time)).await;
                             // Re-initialize client in case something fundamental changed
                             client = s3::Client::new(&config);
@@ -644,17 +677,17 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
             }
         });
     }
-    // Only the workers' clones should keep this open, so that the last worker
-    // to exit closes it and ends the ordering loop.
+    // Leave only the workers' clones, so the last one to exit closes the
+    // channel and ends the ordering loop.
     drop(data_sender);
 
-    // A worker that dies without delivering its block leaves the ordering loop
-    // waiting on an index that can never arrive, while the survivors wait on a
-    // queue that is never refilled. Tearing the rest down closes the data
-    // channel, which ends that loop and lets the completeness check report
-    // what is missing.
+    // A worker that dies without delivering its block leaves the ordering
+    // loop waiting on an index that never arrives, and the survivors waiting
+    // on a queue that is never refilled. Tearing the rest down closes the data
+    // channel, which ends the loop and lets the completeness check report what
+    // is missing.
     //
-    // This works only because the workers await on the queue: a task can be
+    // This only works because the workers await on the queue. Tasks can be
     // cancelled at an await point, never inside a blocking call.
     tokio::spawn(async move {
         while let Some(outcome) = workers.join_next().await {
@@ -706,16 +739,15 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
         }
     }
 
-    // The data channel closing is not by itself proof that every block was
-    // written: it also closes when the workers are torn down. Comparing what
-    // was emitted against what was planned is what keeps a short download from
-    // exiting successfully.
+    // A closed data channel does not prove every block arrived; it also
+    // closes when the workers are torn down. Comparing emitted against planned
+    // is what stops a short download from exiting 0.
     if next_idx != total_blocks {
         anyhow::bail!("Incomplete download: wrote {next_idx} of {total_blocks} blocks");
     }
 
-    // Dropping the writer would flush but discard the result, so a failure on
-    // the final bytes has to be surfaced explicitly.
+    // Dropping the writer flushes but discards the result, so a failure on
+    // the final bytes has to be reported here.
     if let Err(e) = output.finish() {
         if output.is_closed_consumer(&e) {
             return Ok(Completion::ConsumerClosed);
@@ -729,10 +761,9 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
 fn main() {
     let args = Args::parse();
 
-    // Concurrency comes from the number of tasks, not the number of threads,
-    // so the pool is left at tokio's default. No download work blocks a pool
-    // thread; the one exception is the `eprintln!` used for retry diagnostics,
-    // which can park a task if stderr's reader has stopped consuming.
+    // Concurrency comes from the task count, not the thread count, so the
+    // pool stays at tokio's default. Nothing on the download path blocks a
+    // pool thread.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()
@@ -741,13 +772,13 @@ fn main() {
 
     match run(&rt, &args) {
         Err(e) => {
-            // Alternate form prints the source chain; an SdkError on its own
+            // The alternate form prints the source chain. An SdkError alone
             // renders as just "service error".
             eprintln!("Error: {:#}", e);
             std::process::exit(1);
         }
-        // `s3get ... | head` closes the pipe on purpose. The reader's exit
-        // status is the one that matters in a pipeline, so say nothing.
+        // `s3get ... | head` closes the pipe deliberately. The reader's exit
+        // status is the one that matters in a pipeline.
         Ok(Completion::ConsumerClosed) => std::process::exit(0),
         Ok(Completion::Finished) => {}
     }
@@ -770,8 +801,8 @@ mod tests {
         assert_eq!(parse_size("4096b").unwrap(), 4096);
     }
 
-    /// `gb` must not be read as a `b` suffix on the digits "2g", which would
-    /// then fail to parse as a number.
+    /// `gb` must not match as a `b` suffix on the digits "2g", which would
+    /// then fail to parse.
     #[test]
     fn parse_size_prefers_the_longest_unit() {
         assert_eq!(parse_size("2gb").unwrap(), 2 * 1024 * 1024 * 1024);
@@ -779,7 +810,7 @@ mod tests {
         assert_eq!(parse_size("32mb").unwrap(), 32 * 1024 * 1024);
     }
 
-    /// A zero block size reaches `step_by`, which panics.
+    /// A zero block size reaches step_by, which panics.
     #[test]
     fn parse_size_rejects_zero() {
         for input in ["0", "0MB", "0kb", "0g"] {
@@ -794,7 +825,7 @@ mod tests {
         assert!(parse_size("99999999999999999999999").is_err());
     }
 
-    /// Beyond this the i64 range arithmetic goes negative and the block buffer
+    /// Past the cap the i64 range arithmetic goes negative and the block
     /// allocation panics.
     #[test]
     fn parse_size_rejects_values_past_the_cap() {
@@ -810,7 +841,7 @@ mod tests {
         }
     }
 
-    /// Zero workers download nothing at all.
+    /// Zero workers download nothing.
     #[test]
     fn parse_threads_rejects_zero() {
         assert!(parse_threads("0").is_err());
@@ -848,8 +879,8 @@ mod tests {
         }
     }
 
-    /// The range header is inclusive, so the last byte of a block is `end - 1`;
-    /// an off-by-one here either drops or duplicates a byte per block.
+    /// The range header is inclusive, so a block's last byte is `end - 1`. An
+    /// off-by-one here drops or duplicates a byte per block.
     #[test]
     fn block_ranges_tile_the_object_exactly() {
         for (size, block) in [
@@ -886,8 +917,8 @@ mod tests {
         assert_eq!(block_count(33, 32), 2);
     }
 
-    /// An uncapped backoff schedules a wake-up years out; an unchecked `pow`
-    /// overflows outright.
+    /// An uncapped backoff schedules sleeps of days, and an unchecked pow
+    /// overflows.
     #[test]
     fn backoff_is_bounded_at_every_retry_count() {
         for retry in [1u32, 2, 6, 20, 63, 64, u32::MAX] {
@@ -899,7 +930,31 @@ mod tests {
         assert!(backoff_seconds(6) >= MAX_BACKOFF_SECS / 2);
     }
 
-    /// Exiting 0 on a closed pipe must never apply to an explicit --output.
+    /// Reporting must not block the caller. A worker parked writing to a
+    /// stderr nobody drains sits inside its own poll, out of reach of both
+    /// cancellation and the stall timeout, and the download stops.
+    #[test]
+    fn diagnostics_drop_messages_rather_than_block() {
+        // Stands in for a logger thread parked in a write that never returns
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(4);
+        let diagnostics = Diagnostics(sender);
+
+        let started = std::time::Instant::now();
+        for i in 0..100_000 {
+            diagnostics.report(format!("message {i}"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reporting blocked for {:?}",
+            started.elapsed()
+        );
+
+        // Reporting after the consumer is gone must not panic.
+        drop(receiver);
+        diagnostics.report("after shutdown".to_string());
+    }
+
+    /// Exiting 0 on a closed pipe must not apply to an explicit --output.
     #[test]
     fn closed_consumer_is_stdout_only() {
         let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
