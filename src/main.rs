@@ -52,9 +52,12 @@ fn backoff_seconds(retry_count: u32) -> u64 {
 }
 
 /// Where downloaded blocks are written.
+///
+/// The stdout handle is locked once and held: it is the only writer, and
+/// re-acquiring the lock per block is wasted work on a hot path.
 enum Output {
     File(std::fs::File),
-    Stdout(std::io::Stdout),
+    Stdout(std::io::StdoutLock<'static>),
 }
 
 impl Write for Output {
@@ -83,10 +86,48 @@ impl Output {
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()?;
         if let Output::File(file) = self {
-            file.sync_all()?;
+            // Only a regular file can hold a write back long enough to fail at
+            // close. A FIFO, socket or character device has nothing to sync and
+            // answers `fsync` with EINVAL, which would turn `-o /dev/null` and
+            // `-o <fifo>` into failures despite every byte arriving.
+            if file.metadata()?.is_file() {
+                file.sync_all()?;
+            }
         }
         Ok(())
     }
+
+    /// Whether an error means the reader on the other end of a pipe has gone
+    /// away, which for `s3get s3://... | head` is ordinary usage rather than a
+    /// failure. Only ever true for stdout: the same error against `--output`
+    /// is a genuine write failure and must stay fatal.
+    fn is_closed_consumer(&self, e: &std::io::Error) -> bool {
+        matches!(self, Output::Stdout(_)) && e.kind() == std::io::ErrorKind::BrokenPipe
+    }
+}
+
+/// Reports download failures for blocks that were fetched but never written.
+///
+/// Leaving with a closed consumer is a success, so these errors never reach the
+/// exit code. They are still worth saying out loud: a 412 here means the object
+/// was replaced mid-download, and that would otherwise vanish entirely.
+fn report_abandoned_errors(pending: &BTreeMap<Reverse<usize>, Result<Vec<u8>, anyhow::Error>>) {
+    for (Reverse(idx), outcome) in pending {
+        if let Err(e) = outcome {
+            eprintln!(
+                "Warning: chunk {} had failed before the output closed: {:#}",
+                idx, e
+            );
+        }
+    }
+}
+
+/// Why the download stopped.
+enum Completion {
+    /// Every block was written.
+    Finished,
+    /// The process reading our stdout closed the pipe first.
+    ConsumerClosed,
 }
 
 /// A failed download attempt, carrying whether another attempt could succeed.
@@ -198,11 +239,14 @@ async fn download(
                         || (500..600).contains(&status)
                         || RETRYABLE_ERROR_CODES.contains(&code)
                 }
-                // A dispatch failure caused by configuration -- an unresolvable
-                // endpoint, an untrusted certificate chain -- fails the same
-                // way every time, so only transport-level ones are retried.
+                // `is_user` covers requests the client itself could not form.
+                // Connection, DNS and TLS failures are reported as io/other and
+                // stay retryable, since they are usually transient.
                 SdkError::DispatchFailure(failure) => !failure.is_user(),
                 SdkError::ConstructionFailure(_) => false,
+                // `SdkError` is non-exhaustive. An unrecognised failure is
+                // treated as transient: a needless retry costs a delay, while
+                // wrongly giving up abandons the whole download.
                 _ => true,
             };
             return Err(AttemptError {
@@ -316,7 +360,7 @@ async fn probe_object(bucket: &str, key: &str, verbose: u8) -> anyhow::Result<Ob
 /// outside the runtime, because it makes blocking calls -- a write to a slow
 /// consumer can park it indefinitely, and a runtime thread parked in a
 /// blocking call is a runtime thread that cannot service timers.
-fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<()> {
+fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> {
     let (bucket, key) = match args.s3_path.strip_prefix("s3://") {
         None => anyhow::bail!("S3 path has to start with 's3://'"),
         Some(x) => match x.split_once('/') {
@@ -348,7 +392,7 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<()> {
             }
             Ok(file) => Output::File(file),
         },
-        None => Output::Stdout(std::io::stdout()),
+        None => Output::Stdout(std::io::stdout().lock()),
     };
 
     // Bounds how many blocks may be in flight, and so the peak memory.
@@ -436,8 +480,8 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<()> {
     // channel, which ends that loop and lets the completeness check report
     // what is missing.
     //
-    // This works only because the workers are fully asynchronous: a task can
-    // be cancelled at an await point, never inside a blocking call.
+    // This works only because the workers await on the queue: a task can be
+    // cancelled at an await point, never inside a blocking call.
     tokio::spawn(async move {
         while let Some(outcome) = workers.join_next().await {
             if let Err(e) = outcome {
@@ -478,7 +522,13 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<()> {
         while let Some(data) = pending.remove(&Reverse(next_idx)) {
             request_next_block()?;
             next_idx += 1;
-            output.write_all(&data?)?;
+            if let Err(e) = output.write_all(&data?) {
+                if output.is_closed_consumer(&e) {
+                    report_abandoned_errors(&pending);
+                    return Ok(Completion::ConsumerClosed);
+                }
+                return Err(e.into());
+            }
         }
     }
 
@@ -492,26 +542,39 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<()> {
 
     // Dropping the writer would flush but discard the result, so a failure on
     // the final bytes has to be surfaced explicitly.
-    output.finish()?;
+    if let Err(e) = output.finish() {
+        if output.is_closed_consumer(&e) {
+            return Ok(Completion::ConsumerClosed);
+        }
+        return Err(e.into());
+    }
 
-    Ok(())
+    Ok(Completion::Finished)
 }
 
 fn main() {
     let args = Args::parse();
 
     // Concurrency comes from the number of tasks, not the number of threads,
-    // so the pool is left at tokio's default. Nothing running on it blocks.
+    // so the pool is left at tokio's default. No download work blocks a pool
+    // thread; the one exception is the `eprintln!` used for retry diagnostics,
+    // which can park a task if stderr's reader has stopped consuming.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()
         .build()
         .unwrap();
 
-    if let Err(e) = run(&rt, &args) {
-        // Alternate form prints the source chain; an SdkError on its own
-        // renders as just "service error".
-        eprintln!("Error: {:#}", e);
-        std::process::exit(1);
+    match run(&rt, &args) {
+        Err(e) => {
+            // Alternate form prints the source chain; an SdkError on its own
+            // renders as just "service error".
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+        // `s3get ... | head` closes the pipe on purpose. The reader's exit
+        // status is the one that matters in a pipeline, so say nothing.
+        Ok(Completion::ConsumerClosed) => std::process::exit(0),
+        Ok(Completion::Finished) => {}
     }
 }
