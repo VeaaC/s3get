@@ -1,7 +1,6 @@
 use aws_sdk_s3 as s3;
 use clap::Parser;
 use s3::error::{ProvideErrorMetadata, SdkError};
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -179,8 +178,8 @@ impl Output {
 /// Leaving with a closed consumer is a success, so these errors never reach the
 /// exit code. They are still worth saying out loud: a 412 here means the object
 /// was replaced mid-download, and that would otherwise vanish entirely.
-fn report_abandoned_errors(pending: &BTreeMap<Reverse<usize>, Result<Vec<u8>, anyhow::Error>>) {
-    for (Reverse(idx), outcome) in pending {
+fn report_abandoned_errors(pending: &BTreeMap<usize, Result<Vec<u8>, anyhow::Error>>) {
+    for (idx, outcome) in pending {
         if let Err(e) = outcome {
             eprintln!(
                 "Warning: chunk {} had failed before the output closed: {:#}",
@@ -360,7 +359,9 @@ async fn download(
     };
 
     let expected = (end - start) as usize;
-    let mut result = Vec::new();
+    // The exact size is known, so the buffer is allocated once rather than
+    // grown and copied repeatedly across a block.
+    let mut result = Vec::with_capacity(expected);
     loop {
         let chunk = match tokio::time::timeout(stall_timeout, object.body.try_next()).await {
             Err(_) => {
@@ -620,8 +621,8 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
         request_next_block()?;
     }
     while let Some((idx, payload)) = data_receiver.blocking_recv() {
-        pending.insert(Reverse(idx), payload);
-        while let Some(data) = pending.remove(&Reverse(next_idx)) {
+        pending.insert(idx, payload);
+        while let Some(data) = pending.remove(&next_idx) {
             request_next_block()?;
             next_idx += 1;
             if let Err(e) = output.write_all(&data?) {
