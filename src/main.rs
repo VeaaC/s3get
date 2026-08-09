@@ -1,13 +1,18 @@
 use aws_sdk_s3 as s3;
 use clap::Parser;
 use crossbeam::channel;
-use http::StatusCode;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
+
+/// S3 answers a request aimed at the wrong region with a permanent redirect
+/// carrying an `x-amz-bucket-region` header. Spelled out here rather than
+/// pulled from the `http` crate, whose major version would otherwise have to
+/// stay in lockstep with the one vendored inside the smithy runtime.
+const HTTP_MOVED_PERMANENTLY: u16 = 301;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
     let x = x.to_ascii_lowercase();
@@ -83,6 +88,16 @@ async fn config_and_size(
     let mut config = config
         .into_builder()
         .region(region.or_else(|| Some(s3::config::Region::new("us-east-2"))))
+        // Pinned to the pre-1.141 default. Newer SDKs default this to
+        // `WhenSupported`, which asks S3 to return a checksum and then verifies
+        // the body against it -- but the validator has no notion of ranged
+        // requests, and every request this tool makes is a range. Its only
+        // guard is spotting the `-N` suffix of a composite multipart checksum,
+        // which S3 does not necessarily include on a partial response, so a
+        // whole-object checksum could be compared against a single 32MB block
+        // and fail every chunk. Integrity here comes from TLS plus the
+        // per-block length check in `download`.
+        .response_checksum_validation(s3::config::ResponseChecksumValidation::WhenRequired)
         .build();
 
     for _ in 0..3 {
@@ -94,7 +109,7 @@ async fn config_and_size(
                     eprintln!("{:?}", e);
                 }
                 if let s3::error::SdkError::ServiceError(response) = &e {
-                    if response.raw().status().as_u16() == StatusCode::MOVED_PERMANENTLY {
+                    if response.raw().status().as_u16() == HTTP_MOVED_PERMANENTLY {
                         if let Some(x) = response.raw().headers().get("x-amz-bucket-region") {
                             config = config
                                 .into_builder()

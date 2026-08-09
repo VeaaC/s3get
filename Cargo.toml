@@ -5,18 +5,29 @@ edition = "2021"
 rust-version = "1.94.1"
 license = "MIT"
 keywords = ["aws","s3"]
+categories = ["command-line-utilities"]
 description = "Download a single file from S3 using chunks"
 homepage = "https://github.com/VeaaC/s3get"
 repository = "https://github.com/VeaaC/s3get"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.79"
 crossbeam = "0.8.4"
-aws-config = { version = "1.1.4", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.14.0"
-futures = "0.3.30"
-num_cpus = "1.16.0"
-tokio = { version = "1.36.0", features = ["rt-multi-thread", "fs", "sync"] }
-http = "1.0.0"
+aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
+# Every default feature except `rustls`, which is a legacy-compatibility flag
+# that pulls in a *second*, parallel TLS/HTTP stack (hyper 0.14, h2 0.3 and the
+# end-of-life rustls 0.21 line) alongside the modern one supplied by
+# `default-https-client`. Dropping it removes ten crates and retires a rustls
+# release line that will not receive future fixes.
+aws-sdk-s3 = { version = "1.141.0", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
+# "net" is required by `Builder::enable_io`; it previously arrived only by
+# feature unification from hyper-util, so the build would have broken if the
+# smithy HTTP client ever changed transports.
+tokio = { version = "1.36.0", features = ["rt-multi-thread", "time", "net"] }
 clap = { version = "4.4.18", features = ["derive"] }
-time = "0.3.35"
