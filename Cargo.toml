@@ -13,7 +13,6 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.79"
-crossbeam = "0.8.4"
 aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
 # Every default feature except `rustls`, a legacy-compatibility flag that adds
 # a second, parallel TLS/HTTP stack (hyper 0.14, h2 0.3 and the end-of-life
@@ -26,8 +25,13 @@ aws-sdk-s3 = { version = "1.141.0", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-# "net" backs `Builder::enable_io` and "time" backs `enable_time` and
-# `tokio::time::sleep`. Both are declared here rather than left to arrive
-# through another crate's feature selection.
-tokio = { version = "1.36.0", features = ["rt-multi-thread", "time", "net"] }
+# "net" backs `Builder::enable_io`, "time" backs `enable_time` and
+# `tokio::time::sleep`/`timeout`, and "sync" backs the mpsc work queue. All are
+# declared here rather than left to arrive through another crate's features.
+tokio = { version = "1.36.0", features = [
+    "rt-multi-thread",
+    "time",
+    "net",
+    "sync",
+] }
 clap = { version = "4.4.18", features = ["derive"] }
