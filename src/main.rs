@@ -4,7 +4,7 @@ use s3::error::{ProvideErrorMetadata, SdkError};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,26 +51,89 @@ fn backoff_seconds(retry_count: u32) -> u64 {
     half + jitter % (half + 1)
 }
 
+/// A `--output` destination.
+///
+/// When the destination is a regular file the bytes are staged in a sibling
+/// temp file and renamed into place once the download is complete, so an
+/// interrupted run never leaves a partial file that looks finished. Anything
+/// else -- `/dev/null`, a FIFO, a device node -- is written straight through,
+/// since renaming over it would replace the thing the user pointed at.
+struct FileOutput {
+    file: std::fs::File,
+    /// The staging path, taken on success and removed on drop.
+    temp_path: Option<PathBuf>,
+    destination: PathBuf,
+}
+
+impl FileOutput {
+    fn create(destination: &Path) -> std::io::Result<Self> {
+        let stage = match std::fs::metadata(destination) {
+            Ok(metadata) => metadata.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e),
+        };
+
+        if !stage {
+            return Ok(Self {
+                file: std::fs::File::create(destination)?,
+                temp_path: None,
+                destination: destination.to_path_buf(),
+            });
+        }
+
+        let name = destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        // A sibling, so the rename stays within one filesystem, and
+        // process-unique so concurrent runs cannot collide.
+        let temp_path =
+            destination.with_file_name(format!(".{}.s3get-{}.part", name, std::process::id()));
+        let file = std::fs::File::create(&temp_path)?;
+        // A fresh file would otherwise pick up the umask default and quietly
+        // widen the permissions of a file being replaced.
+        if let Ok(metadata) = std::fs::metadata(destination) {
+            let _ = file.set_permissions(metadata.permissions());
+        }
+
+        Ok(Self {
+            file,
+            temp_path: Some(temp_path),
+            destination: destination.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for FileOutput {
+    fn drop(&mut self) {
+        // Still present means `finish` never ran, so the download did not
+        // complete and the staged bytes are worthless.
+        if let Some(temp_path) = &self.temp_path {
+            let _ = std::fs::remove_file(temp_path);
+        }
+    }
+}
+
 /// Where downloaded blocks are written.
 ///
 /// The stdout handle is locked once and held: it is the only writer, and
 /// re-acquiring the lock per block is wasted work on a hot path.
 enum Output {
-    File(std::fs::File),
+    File(FileOutput),
     Stdout(std::io::StdoutLock<'static>),
 }
 
 impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Output::File(file) => file.write(buf),
+            Output::File(out) => out.file.write(buf),
             Output::Stdout(stdout) => stdout.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Output::File(file) => file.flush(),
+            Output::File(out) => out.file.flush(),
             Output::Stdout(stdout) => stdout.flush(),
         }
     }
@@ -85,13 +148,18 @@ impl Output {
     /// a failed write into a failed exit.
     fn finish(&mut self) -> std::io::Result<()> {
         self.flush()?;
-        if let Output::File(file) = self {
+        if let Output::File(out) = self {
             // Only a regular file can hold a write back long enough to fail at
             // close. A FIFO, socket or character device has nothing to sync and
             // answers `fsync` with EINVAL, which would turn `-o /dev/null` and
             // `-o <fifo>` into failures despite every byte arriving.
-            if file.metadata()?.is_file() {
-                file.sync_all()?;
+            if out.file.metadata()?.is_file() {
+                out.file.sync_all()?;
+            }
+            // Taking the path both publishes the result and disarms the
+            // cleanup in `Drop`.
+            if let Some(temp_path) = out.temp_path.take() {
+                std::fs::rename(&temp_path, &out.destination)?;
             }
         }
         Ok(())
@@ -145,18 +213,51 @@ impl AttemptError {
     }
 }
 
+/// Byte-count units, longest suffix first so that `gb` is not read as `b`.
+const SIZE_UNITS: &[(&str, usize)] = &[
+    ("gb", 1024 * 1024 * 1024),
+    ("g", 1024 * 1024 * 1024),
+    ("mb", 1024 * 1024),
+    ("m", 1024 * 1024),
+    ("kb", 1024),
+    ("k", 1024),
+    ("b", 1),
+];
+
+/// Parses a byte count, with or without a unit: `32MB`, `512kb`, `1g`,
+/// `1048576`. Case-insensitive. Whole numbers only, and never zero.
 fn parse_size(x: &str) -> anyhow::Result<usize> {
-    let x = x.to_ascii_lowercase();
-    if let Some(value) = x.strip_suffix("gb") {
-        return Ok(usize::from_str(value)? * 1024 * 1024 * 1024);
+    let lowered = x.trim().to_ascii_lowercase();
+    let (digits, unit) = SIZE_UNITS
+        .iter()
+        .find_map(|(suffix, unit)| lowered.strip_suffix(suffix).map(|d| (d, *unit)))
+        .unwrap_or((lowered.as_str(), 1));
+
+    let value = usize::from_str(digits.trim()).map_err(|_| {
+        anyhow::anyhow!(
+            "Cannot parse size '{x}': expected a whole number, e.g. 32MB, 512kb or 1048576"
+        )
+    })?;
+
+    // A zero block size would make `step_by` panic before any request is sent.
+    if value == 0 {
+        anyhow::bail!("Size must be greater than zero, got '{x}'");
     }
-    if let Some(value) = x.strip_suffix("mb") {
-        return Ok(usize::from_str(value)? * 1024 * 1024);
+
+    value
+        .checked_mul(unit)
+        .ok_or_else(|| anyhow::anyhow!("Size '{x}' is too large to represent"))
+}
+
+/// Rejects a concurrency of zero, which would spawn no workers and download
+/// nothing.
+fn parse_threads(x: &str) -> anyhow::Result<usize> {
+    let value = usize::from_str(x.trim())
+        .map_err(|_| anyhow::anyhow!("Cannot parse thread count '{x}'"))?;
+    if value == 0 {
+        anyhow::bail!("At least one thread is required");
     }
-    if let Some(value) = x.strip_suffix("kb") {
-        return Ok(usize::from_str(value)? * 1024);
-    }
-    anyhow::bail!("Cannot parse size: '{}'", x)
+    Ok(value)
 }
 
 #[derive(Parser)]
@@ -169,12 +270,13 @@ struct Args {
     #[arg(long, short)]
     output: Option<PathBuf>,
 
-    /// Block size used for data downloads
+    /// Block size used for data downloads. Peak memory is roughly
+    /// 2 * threads * block-size, so 384MB at the defaults
     #[arg(long, default_value = "32MB", value_parser = parse_size)]
     block_size: usize,
 
-    /// Number of threads to use, defaults to number of logical cores
-    #[arg(long, short, default_value = "6")]
+    /// Number of chunks to download concurrently
+    #[arg(long, short, default_value = "6", value_parser = parse_threads)]
     threads: usize,
 
     /// Print verbose information, statistics, etc
@@ -385,12 +487,12 @@ fn run(rt: &tokio::runtime::Runtime, args: &Args) -> anyhow::Result<Completion> 
     }
 
     let mut output = match &args.output {
-        Some(path) => match std::fs::File::create(path) {
+        Some(path) => match FileOutput::create(path) {
             Err(e) => {
                 eprintln!("Failed to open output file: {}", e);
                 std::process::exit(1);
             }
-            Ok(file) => Output::File(file),
+            Ok(out) => Output::File(out),
         },
         None => Output::Stdout(std::io::stdout().lock()),
     };
