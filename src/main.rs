@@ -2,6 +2,7 @@ use aws_sdk_s3 as s3;
 use clap::Parser;
 use s3::error::{ProvideErrorMetadata, SdkError};
 use std::collections::BTreeMap;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -66,40 +67,79 @@ struct FileOutput {
 
 impl FileOutput {
     fn create(destination: &Path) -> std::io::Result<Self> {
-        let stage = match std::fs::metadata(destination) {
+        // `symlink_metadata` does not follow links, so a symlink is written
+        // through rather than replaced by the rename.
+        let stage = match std::fs::symlink_metadata(destination) {
             Ok(metadata) => metadata.is_file(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
             Err(e) => return Err(e),
         };
 
         if !stage {
-            return Ok(Self {
-                file: std::fs::File::create(destination)?,
-                temp_path: None,
-                destination: destination.to_path_buf(),
-            });
+            return Self::in_place(destination);
         }
 
+        // Staging needs to create a sibling, which write access to the
+        // destination does not imply, and whose longer name can exceed the
+        // filesystem limit. Writing in place still works in both cases and is
+        // no worse than not staging at all.
+        Self::staged(destination).or_else(|_| Self::in_place(destination))
+    }
+
+    fn in_place(destination: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::create(destination)?,
+            temp_path: None,
+            destination: destination.to_path_buf(),
+        })
+    }
+
+    fn staged(destination: &Path) -> std::io::Result<Self> {
         let name = destination
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        // A sibling, so the rename stays within one filesystem, and
-        // process-unique so concurrent runs cannot collide.
-        let temp_path =
-            destination.with_file_name(format!(".{}.s3get-{}.part", name, std::process::id()));
-        let file = std::fs::File::create(&temp_path)?;
-        // A fresh file would otherwise pick up the umask default and quietly
-        // widen the permissions of a file being replaced.
-        if let Ok(metadata) = std::fs::metadata(destination) {
-            let _ = file.set_permissions(metadata.permissions());
-        }
 
-        Ok(Self {
-            file,
-            temp_path: Some(temp_path),
-            destination: destination.to_path_buf(),
-        })
+        // `create_new` refuses to open anything that already exists, symlink
+        // included, so a name guessed by another user in a shared directory
+        // cannot redirect the download. The suffix is randomised so that
+        // repeated guessing cannot keep winning the race either.
+        let mut last_error = None;
+        for _ in 0..16 {
+            let suffix = std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish();
+            // A sibling, so the rename stays on one filesystem.
+            let temp_path = destination.with_file_name(format!(".{name}.s3get-{suffix:x}.part"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => {
+                    // A fresh file would otherwise take the umask default and
+                    // quietly widen the mode of the file being replaced. Only
+                    // the mode bits carry over: ACLs, xattrs and hard links
+                    // belong to the old inode and do not survive a rename.
+                    if let Ok(metadata) = std::fs::metadata(destination) {
+                        let _ = file.set_permissions(metadata.permissions());
+                    }
+                    return Ok(Self {
+                        file,
+                        temp_path: Some(temp_path),
+                        destination: destination.to_path_buf(),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_error = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not create a staging file",
+            )
+        }))
     }
 }
 
@@ -155,10 +195,11 @@ impl Output {
             if out.file.metadata()?.is_file() {
                 out.file.sync_all()?;
             }
-            // Taking the path both publishes the result and disarms the
-            // cleanup in `Drop`.
-            if let Some(temp_path) = out.temp_path.take() {
-                std::fs::rename(&temp_path, &out.destination)?;
+            // Cleared only once the rename has succeeded, so a failure here
+            // still leaves `Drop` armed to remove the staging file.
+            if let Some(temp_path) = out.temp_path.as_ref() {
+                std::fs::rename(temp_path, &out.destination)?;
+                out.temp_path = None;
             }
         }
         Ok(())
@@ -212,6 +253,10 @@ impl AttemptError {
     }
 }
 
+/// Upper bound on a parsed size. Far above any useful block size, and low
+/// enough that block offsets stay well inside `i64`.
+const MAX_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 /// Byte-count units, longest suffix first so that `gb` is not read as `b`.
 const SIZE_UNITS: &[(&str, usize)] = &[
     ("gb", 1024 * 1024 * 1024),
@@ -243,9 +288,18 @@ fn parse_size(x: &str) -> anyhow::Result<usize> {
         anyhow::bail!("Size must be greater than zero, got '{x}'");
     }
 
-    value
+    let size = value
         .checked_mul(unit)
-        .ok_or_else(|| anyhow::anyhow!("Size '{x}' is too large to represent"))
+        .ok_or_else(|| anyhow::anyhow!("Size '{x}' is too large to represent"))?;
+
+    // Blocks are addressed as i64 byte offsets and buffered whole, so an
+    // unbounded value would wrap the range arithmetic negative and then ask for
+    // an impossible allocation.
+    if size > MAX_SIZE {
+        anyhow::bail!("Size '{x}' exceeds the {MAX_SIZE}-byte maximum");
+    }
+
+    Ok(size)
 }
 
 /// Rejects a concurrency of zero, which would spawn no workers and download
