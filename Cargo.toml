@@ -15,19 +15,19 @@ readme = "README.md"
 anyhow = "1.0.79"
 crossbeam = "0.8.4"
 aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
-# Every default feature except `rustls`, which is a legacy-compatibility flag
-# that pulls in a *second*, parallel TLS/HTTP stack (hyper 0.14, h2 0.3 and the
-# end-of-life rustls 0.21 line) alongside the modern one supplied by
-# `default-https-client`. Dropping it removes ten crates and retires a rustls
-# release line that will not receive future fixes.
+# Every default feature except `rustls`, a legacy-compatibility flag that adds
+# a second, parallel TLS/HTTP stack (hyper 0.14, h2 0.3 and the end-of-life
+# rustls 0.21 line) beside the modern one `default-https-client` provides.
+# Omitting it keeps the graph ten crates smaller and off an unmaintained
+# rustls release line.
 aws-sdk-s3 = { version = "1.141.0", default-features = false, features = [
     "sigv4a",
     "http-1x",
     "default-https-client",
     "rt-tokio",
 ] }
-# "net" is required by `Builder::enable_io`; it previously arrived only by
-# feature unification from hyper-util, so the build would have broken if the
-# smithy HTTP client ever changed transports.
+# "net" backs `Builder::enable_io` and "time" backs `enable_time` and
+# `tokio::time::sleep`. Both are declared here rather than left to arrive
+# through another crate's feature selection.
 tokio = { version = "1.36.0", features = ["rt-multi-thread", "time", "net"] }
 clap = { version = "4.4.18", features = ["derive"] }

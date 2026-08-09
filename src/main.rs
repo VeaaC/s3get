@@ -9,9 +9,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 /// S3 answers a request aimed at the wrong region with a permanent redirect
-/// carrying an `x-amz-bucket-region` header. Spelled out here rather than
-/// pulled from the `http` crate, whose major version would otherwise have to
-/// stay in lockstep with the one vendored inside the smithy runtime.
+/// carrying an `x-amz-bucket-region` header.
+///
+/// Defined here so the crate needs no dependency on `http`, whose major
+/// version would have to track the one vendored inside the smithy runtime.
 const HTTP_MOVED_PERMANENTLY: u16 = 301;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
@@ -88,14 +89,12 @@ async fn config_and_size(
     let mut config = config
         .into_builder()
         .region(region.or_else(|| Some(s3::config::Region::new("us-east-2"))))
-        // Pinned to the pre-1.141 default. Newer SDKs default this to
-        // `WhenSupported`, which asks S3 to return a checksum and then verifies
-        // the body against it -- but the validator has no notion of ranged
-        // requests, and every request this tool makes is a range. Its only
-        // guard is spotting the `-N` suffix of a composite multipart checksum,
-        // which S3 does not necessarily include on a partial response, so a
-        // whole-object checksum could be compared against a single 32MB block
-        // and fail every chunk. Integrity here comes from TLS plus the
+        // `WhenSupported` asks S3 for a checksum and validates the body
+        // against it, but the validator has no notion of ranged requests and
+        // every request here is a range. Its only guard is spotting the `-N`
+        // suffix of a composite multipart checksum, which S3 need not include
+        // on a partial response, so a whole-object checksum can end up
+        // compared against a single block. Integrity comes from TLS and the
         // per-block length check in `download`.
         .response_checksum_validation(s3::config::ResponseChecksumValidation::WhenRequired)
         .build();
