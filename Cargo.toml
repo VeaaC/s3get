@@ -1,21 +1,18 @@
 [package]
 name = "s3get"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
+rust-version = "1.91.1"
 license = "MIT"
-keywords = ["aws","s3"]
+keywords = ["aws", "s3"]
 description = "Download a single file from S3 using chunks"
 homepage = "https://github.com/VeaaC/s3get"
 repository = "https://github.com/VeaaC/s3get"
 
 [dependencies]
-anyhow = "1.0.79"
-crossbeam = "0.8.4"
-aws-config = { version = "1.1.4", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.14.0"
-futures = "0.3.30"
-num_cpus = "1.16.0"
-tokio = { version = "1.36.0", features = ["rt-multi-thread", "fs", "sync"] }
-http = "1.0.0"
-clap = { version = "4.4.18", features = ["derive"] }
-time = "0.3.35"
+anyhow = "1.0.104"
+aws-config = { version = "1.8.18", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.137.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs", "sync"] }
+http = "1.5.0"
+clap = { version = "4.6.7", features = ["derive"] }

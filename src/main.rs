@@ -1,12 +1,11 @@
 use aws_sdk_s3 as s3;
 use clap::Parser;
-use crossbeam::channel;
-use http::StatusCode;
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
@@ -37,7 +36,7 @@ struct Args {
     #[arg(long, default_value = "32MB", value_parser = parse_size)]
     block_size: usize,
 
-    /// Number of threads to use, defaults to number of logical cores
+    /// Number of concurrent downloads
     #[arg(long, short, default_value = "6")]
     threads: usize,
 
@@ -57,7 +56,7 @@ async fn download(
     start: i64,
     end: i64,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut object = client
+    let object = client
         .get_object()
         .bucket(bucket)
         .key(key)
@@ -65,12 +64,7 @@ async fn download(
         .send()
         .await?;
 
-    let mut result = Vec::new();
-    while let Some(chunk) = object.body.try_next().await? {
-        result.extend(chunk);
-    }
-
-    Ok(result)
+    Ok(object.body.collect().await?.into_bytes().to_vec())
 }
 
 async fn config_and_size(
@@ -78,7 +72,7 @@ async fn config_and_size(
     key: &str,
     verbose: u8,
 ) -> anyhow::Result<(aws_config::SdkConfig, i64)> {
-    let config = aws_config::load_from_env().await;
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let region = config.region().cloned();
     let mut config = config
         .into_builder()
@@ -94,7 +88,7 @@ async fn config_and_size(
                     eprintln!("{:?}", e);
                 }
                 if let s3::error::SdkError::ServiceError(response) = &e {
-                    if response.raw().status().as_u16() == StatusCode::MOVED_PERMANENTLY {
+                    if response.raw().status().as_u16() == 301 {
                         if let Some(x) = response.raw().headers().get("x-amz-bucket-region") {
                             config = config
                                 .into_builder()
@@ -111,10 +105,10 @@ async fn config_and_size(
             }
         };
 
-        let size = match head.content_length {
-            None => anyhow::bail!("Could not get content size"),
-            Some(x) => x,
-        };
+        let size = head.content_length.unwrap_or(0);
+        if size == 0 {
+            anyhow::bail!("Could not get content size (or file is empty)");
+        }
 
         return Ok((config, size));
     }
@@ -136,97 +130,114 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         eprintln!("Downloading {} bytes", size);
     }
 
-    let mut output: Box<dyn std::io::Write + Send + Sync> = if let Some(file) = &args.output {
-        Box::new(match std::fs::File::create(file) {
-            Err(e) => {
-                eprintln!("Failed to open output file: {}", e);
-                std::process::exit(1);
-            }
-            Ok(x) => x,
-        })
+    let mut output: Box<dyn Write + Send + Sync> = if let Some(file) = &args.output {
+        Box::new(std::io::BufWriter::new(std::fs::File::create(file)?))
     } else {
-        Box::new(std::io::stdout())
+        Box::new(std::io::BufWriter::new(std::io::stdout()))
     };
 
-    let num_tokens = 2 * args.threads;
-    let mut blocks = (0..size)
+    let blocks: Vec<(usize, (i64, i64))> = (0..size)
         .step_by(args.block_size)
-        .map(move |start| (start, size.min(start + args.block_size as i64)))
+        .map(|start| (start, size.min(start + args.block_size as i64)))
         .enumerate()
-        .fuse();
+        .collect();
 
-    let (iter_sender, iter_receiver) = channel::bounded(num_tokens);
-    let (data_sender, data_receiver) = channel::bounded(num_tokens);
+    let total_blocks = blocks.len();
+    let num_buffer = 2 * args.threads;
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<(usize, anyhow::Result<Vec<u8>>)>(num_buffer);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.threads));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let client = s3::Client::new(&config);
 
-    for thread in 0..args.threads {
-        let data_sender = data_sender.clone();
-        let iter_receiver = iter_receiver.clone();
+    let dispatcher = {
+        let tx = tx;
+        let semaphore = semaphore.clone();
+        let cancelled = cancelled.clone();
+        let client = client.clone();
         let bucket = bucket.clone();
         let key = key.clone();
-        let max_retries = args.max_retries;
         let config = config.clone();
+        let max_retries = args.max_retries;
+        let verbose = args.verbose;
         tokio::spawn(async move {
-            let data_sender = data_sender;
-            let mut client = s3::Client::new(&config);
-            while let Ok((i, (start, end))) = iter_receiver.recv() {
-                let mut retry_count = 0;
-                let data = loop {
-                    match download(&client, &bucket, &key, start, end).await {
-                        Err(e) => {
-                            retry_count += 1;
-                            if retry_count > max_retries {
-                                break Err(e);
-                            }
-                            let waiting_time = 2_u64.pow(retry_count);
-                            eprintln!(
-                                "Thread {thread}: Failed to download chunk {i}: {}, retrying in {}s",
-                                e, waiting_time
-                            );
-                            tokio::time::sleep(Duration::from_secs(waiting_time)).await;
-                            // Re-initialize client in case something fundamental changed
-                            client = s3::Client::new(&config);
-                        }
-                        Ok(x) => break Ok(x),
-                    }
-                };
-                if data_sender.send((i, data)).is_err() {
+            for (i, (start, end)) in blocks {
+                if cancelled.load(Ordering::Relaxed) || tx.is_closed() {
                     break;
                 }
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let tx = tx.clone();
+                let cancelled = cancelled.clone();
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let key = key.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut current_client = client;
+                    let mut retry_count = 0u32;
+                    let data = loop {
+                        match download(&current_client, &bucket, &key, start, end).await {
+                            Ok(x) => break Ok(x),
+                            Err(e) => {
+                                retry_count += 1;
+                                if retry_count > max_retries
+                                    || cancelled.load(Ordering::Relaxed)
+                                {
+                                    break Err(e);
+                                }
+                                let waiting_time = 2u64.pow(retry_count);
+                                if verbose > 0 {
+                                    eprintln!(
+                                        "Failed to download chunk {i}: {e}, retrying in {waiting_time}s"
+                                    );
+                                }
+                                tokio::time::sleep(Duration::from_secs(waiting_time)).await;
+                                current_client = s3::Client::new(&config);
+                            }
+                        }
+                    };
+                    let _ = tx.send((i, data)).await;
+                });
             }
-        });
-    }
-    drop(data_sender); // drop to make sure iteration will finish once all senders are out of scope
+        })
+    };
 
-    let mut iter_sender = Some(iter_sender);
-    let mut request_next_block = move || match &iter_sender {
-        None => Ok(()),
-        Some(sender) => {
-            match blocks.next() {
-                None => {
-                    iter_sender = None;
-                }
-                Some(x) => {
-                    if sender.send(x).is_err() {
-                        anyhow::bail!("Aborted during communication");
+    let mut pending: BTreeMap<usize, anyhow::Result<Vec<u8>>> = BTreeMap::new();
+    let mut next_idx = 0usize;
+
+    while let Some((i, data)) = rx.recv().await {
+        pending.insert(i, data);
+        while let Some(data) = pending.remove(&next_idx) {
+            next_idx += 1;
+            match data {
+                Ok(bytes) => {
+                    if let Err(e) = output.write_all(&bytes) {
+                        cancelled.store(true, Ordering::Relaxed);
+                        semaphore.close();
+                        return Err(e.into());
                     }
                 }
+                Err(e) => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    semaphore.close();
+                    return Err(e);
+                }
             }
-            Ok(())
         }
-    };
-    let mut pending = BTreeMap::new();
-    let mut next_idx = 0;
-    for _ in 0..num_tokens {
-        request_next_block()?;
-    }
-    for result in data_receiver {
-        pending.insert(Reverse(result.0), result.1);
-        while let Some(data) = pending.remove(&Reverse(next_idx)) {
-            request_next_block()?;
-            next_idx += 1;
-            output.write_all(&data?)?;
+        if next_idx >= total_blocks {
+            break;
         }
     }
+
+    output.flush()?;
+    let _ = dispatcher.await;
 
     Ok(())
 }
@@ -235,13 +246,17 @@ fn main() {
     let args = Args::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads + 2) // we need 2 extra threads for blocking I/O
         .enable_io()
         .enable_time()
         .build()
         .unwrap();
 
-    if let Err(e) = rt.block_on(async move { run(&args).await }) {
+    if let Err(e) = rt.block_on(run(&args)) {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+        }
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
