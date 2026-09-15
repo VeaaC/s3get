@@ -13,6 +13,6 @@ repository = "https://github.com/VeaaC/s3get"
 anyhow = "1.0.104"
 aws-config = { version = "1.8.18", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.137.0"
+bytes = "1.12.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs", "sync"] }
-http = "1.5.0"
 clap = { version = "4.6.7", features = ["derive"] }

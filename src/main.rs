@@ -1,4 +1,5 @@
 use aws_sdk_s3 as s3;
+use bytes::Bytes;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -7,6 +8,8 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+const MAX_BACKOFF_SECS: u64 = 60;
 
 fn parse_size(x: &str) -> anyhow::Result<usize> {
     let x = x.to_ascii_lowercase();
@@ -55,7 +58,7 @@ async fn download(
     key: &str,
     start: i64,
     end: i64,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Bytes> {
     let object = client
         .get_object()
         .bucket(bucket)
@@ -64,7 +67,7 @@ async fn download(
         .send()
         .await?;
 
-    Ok(object.body.collect().await?.into_bytes().to_vec())
+    Ok(object.body.collect().await?.into_bytes())
 }
 
 async fn config_and_size(
@@ -144,39 +147,39 @@ async fn run(args: &Args) -> anyhow::Result<()> {
 
     let total_blocks = blocks.len();
     let num_buffer = 2 * args.threads;
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<(usize, anyhow::Result<Vec<u8>>)>(num_buffer);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.threads));
+    let (result_tx, mut result_rx) =
+        tokio::sync::mpsc::channel::<(usize, anyhow::Result<Bytes>)>(num_buffer);
+    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel::<()>(num_buffer);
     let cancelled = Arc::new(AtomicBool::new(false));
     let client = s3::Client::new(&config);
 
+    // Pre-fill demand tokens to kick off the pipeline
+    for _ in 0..num_buffer {
+        let _ = demand_tx.try_send(());
+    }
+
+    // Dispatcher: spawns download tasks gated by demand tokens (backpressure + concurrency)
     let dispatcher = {
-        let tx = tx;
-        let semaphore = semaphore.clone();
+        let result_tx = result_tx;
         let cancelled = cancelled.clone();
         let client = client.clone();
         let bucket = bucket.clone();
         let key = key.clone();
         let config = config.clone();
         let max_retries = args.max_retries;
-        let verbose = args.verbose;
+        let mut demand_rx = demand_rx;
         tokio::spawn(async move {
             for (i, (start, end)) in blocks {
-                if cancelled.load(Ordering::Relaxed) || tx.is_closed() {
+                if demand_rx.recv().await.is_none() || cancelled.load(Ordering::Relaxed) {
                     break;
                 }
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let tx = tx.clone();
+                let result_tx = result_tx.clone();
                 let cancelled = cancelled.clone();
                 let client = client.clone();
                 let bucket = bucket.clone();
                 let key = key.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     if cancelled.load(Ordering::Relaxed) {
                         return;
                     }
@@ -192,27 +195,27 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                                 {
                                     break Err(e);
                                 }
-                                let waiting_time = 2u64.pow(retry_count);
-                                if verbose > 0 {
-                                    eprintln!(
-                                        "Failed to download chunk {i}: {e}, retrying in {waiting_time}s"
-                                    );
-                                }
+                                let waiting_time =
+                                    2u64.saturating_pow(retry_count).min(MAX_BACKOFF_SECS);
+                                eprintln!(
+                                    "Failed to download chunk {i}: {e}, retrying in {waiting_time}s"
+                                );
                                 tokio::time::sleep(Duration::from_secs(waiting_time)).await;
                                 current_client = s3::Client::new(&config);
                             }
                         }
                     };
-                    let _ = tx.send((i, data)).await;
+                    let _ = result_tx.send((i, data)).await;
                 });
             }
         })
     };
 
-    let mut pending: BTreeMap<usize, anyhow::Result<Vec<u8>>> = BTreeMap::new();
+    // Receive results, write in order, return demand tokens to drive more dispatches
+    let mut pending: BTreeMap<usize, anyhow::Result<Bytes>> = BTreeMap::new();
     let mut next_idx = 0usize;
 
-    while let Some((i, data)) = rx.recv().await {
+    while let Some((i, data)) = result_rx.recv().await {
         pending.insert(i, data);
         while let Some(data) = pending.remove(&next_idx) {
             next_idx += 1;
@@ -220,13 +223,12 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                 Ok(bytes) => {
                     if let Err(e) = output.write_all(&bytes) {
                         cancelled.store(true, Ordering::Relaxed);
-                        semaphore.close();
                         return Err(e.into());
                     }
+                    let _ = demand_tx.try_send(());
                 }
                 Err(e) => {
                     cancelled.store(true, Ordering::Relaxed);
-                    semaphore.close();
                     return Err(e);
                 }
             }
@@ -236,8 +238,18 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         }
     }
 
+    if next_idx < total_blocks {
+        anyhow::bail!(
+            "Download incomplete: got {} of {} blocks",
+            next_idx,
+            total_blocks
+        );
+    }
+
     output.flush()?;
-    let _ = dispatcher.await;
+    dispatcher
+        .await
+        .map_err(|e| anyhow::anyhow!("download dispatcher panicked: {e}"))?;
 
     Ok(())
 }
