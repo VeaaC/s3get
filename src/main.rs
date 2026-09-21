@@ -139,85 +139,99 @@ async fn run(args: &Args) -> anyhow::Result<()> {
         Box::new(std::io::BufWriter::new(std::io::stdout()))
     };
 
-    let blocks: Vec<(usize, (i64, i64))> = (0..size)
-        .step_by(args.block_size)
-        .map(|start| (start, size.min(start + args.block_size as i64)))
-        .enumerate()
-        .collect();
-
-    let total_blocks = blocks.len();
     let num_buffer = 2 * args.threads;
+    let mut blocks = (0..size)
+        .step_by(args.block_size)
+        .map(move |start| (start, size.min(start + args.block_size as i64)))
+        .enumerate()
+        .fuse();
+
+    let (work_tx, work_rx) =
+        tokio::sync::mpsc::channel::<(usize, (i64, i64))>(num_buffer);
+    let work_rx = Arc::new(tokio::sync::Mutex::new(work_rx));
     let (result_tx, mut result_rx) =
         tokio::sync::mpsc::channel::<(usize, anyhow::Result<Bytes>)>(num_buffer);
-    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel::<()>(num_buffer);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let client = s3::Client::new(&config);
 
-    // Pre-fill demand tokens to kick off the pipeline
-    for _ in 0..num_buffer {
-        let _ = demand_tx.try_send(());
-    }
-
-    // Dispatcher: spawns download tasks gated by demand tokens (backpressure + concurrency)
-    let dispatcher = {
-        let result_tx = result_tx;
+    // Spawn persistent workers — each has its own client for connection reuse
+    for _ in 0..args.threads {
+        let work_rx = work_rx.clone();
+        let result_tx = result_tx.clone();
         let cancelled = cancelled.clone();
-        let client = client.clone();
+        let config = config.clone();
         let bucket = bucket.clone();
         let key = key.clone();
-        let config = config.clone();
         let max_retries = args.max_retries;
-        let mut demand_rx = demand_rx;
         tokio::spawn(async move {
-            for (i, (start, end)) in blocks {
-                if demand_rx.recv().await.is_none() || cancelled.load(Ordering::Relaxed) {
+            let mut client = s3::Client::new(&config);
+            loop {
+                let item = {
+                    let mut rx = work_rx.lock().await;
+                    rx.recv().await
+                };
+                let Some((i, (start, end))) = item else { break };
+                if cancelled.load(Ordering::Relaxed) {
                     break;
                 }
-                let result_tx = result_tx.clone();
-                let cancelled = cancelled.clone();
-                let client = client.clone();
-                let bucket = bucket.clone();
-                let key = key.clone();
-                let config = config.clone();
-                tokio::spawn(async move {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let mut current_client = client;
-                    let mut retry_count = 0u32;
-                    let data = loop {
-                        match download(&current_client, &bucket, &key, start, end).await {
-                            Ok(x) => break Ok(x),
-                            Err(e) => {
-                                retry_count += 1;
-                                if retry_count > max_retries
-                                    || cancelled.load(Ordering::Relaxed)
-                                {
-                                    break Err(e);
-                                }
-                                let waiting_time =
-                                    2u64.saturating_pow(retry_count).min(MAX_BACKOFF_SECS);
-                                eprintln!(
-                                    "Failed to download chunk {i}: {e}, retrying in {waiting_time}s"
-                                );
-                                tokio::time::sleep(Duration::from_secs(waiting_time)).await;
-                                current_client = s3::Client::new(&config);
+                let mut retry_count = 0u32;
+                let data = loop {
+                    match download(&client, &bucket, &key, start, end).await {
+                        Ok(x) => break Ok(x),
+                        Err(e) => {
+                            retry_count += 1;
+                            if retry_count > max_retries
+                                || cancelled.load(Ordering::Relaxed)
+                            {
+                                break Err(e);
                             }
+                            let waiting_time =
+                                2u64.saturating_pow(retry_count).min(MAX_BACKOFF_SECS);
+                            eprintln!(
+                                "Failed to download chunk {i}: {e}, retrying in {waiting_time}s"
+                            );
+                            tokio::time::sleep(Duration::from_secs(waiting_time)).await;
+                            client = s3::Client::new(&config);
                         }
-                    };
-                    let _ = result_tx.send((i, data)).await;
-                });
+                    }
+                };
+                if result_tx.send((i, data)).await.is_err() {
+                    break;
+                }
             }
-        })
+        });
+    }
+    drop(result_tx);
+
+    // Pre-fill work queue
+    let mut work_tx = Some(work_tx);
+    let dispatch_next = |work_tx: &mut Option<tokio::sync::mpsc::Sender<_>>,
+                              blocks: &mut std::iter::Fuse<_>| {
+        if let Some(tx) = work_tx {
+            match blocks.next() {
+                None => {
+                    *work_tx = None;
+                }
+                Some(block) => {
+                    if tx.try_send(block).is_err() {
+                        *work_tx = None;
+                    }
+                }
+            }
+        }
     };
 
-    // Receive results, write in order, return demand tokens to drive more dispatches
+    for _ in 0..num_buffer {
+        dispatch_next(&mut work_tx, &mut blocks);
+    }
+
+    // Receive results, write in order, dispatch new work before writing (overlap I/O)
     let mut pending: BTreeMap<usize, anyhow::Result<Bytes>> = BTreeMap::new();
     let mut next_idx = 0usize;
 
     while let Some((i, data)) = result_rx.recv().await {
         pending.insert(i, data);
         while let Some(data) = pending.remove(&next_idx) {
+            dispatch_next(&mut work_tx, &mut blocks);
             next_idx += 1;
             match data {
                 Ok(bytes) => {
@@ -225,7 +239,6 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                         cancelled.store(true, Ordering::Relaxed);
                         return Err(e.into());
                     }
-                    let _ = demand_tx.try_send(());
                 }
                 Err(e) => {
                     cancelled.store(true, Ordering::Relaxed);
@@ -233,11 +246,9 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                 }
             }
         }
-        if next_idx >= total_blocks {
-            break;
-        }
     }
 
+    let total_blocks = (size as usize).div_ceil(args.block_size);
     if next_idx < total_blocks {
         anyhow::bail!(
             "Download incomplete: got {} of {} blocks",
@@ -247,10 +258,6 @@ async fn run(args: &Args) -> anyhow::Result<()> {
     }
 
     output.flush()?;
-    dispatcher
-        .await
-        .map_err(|e| anyhow::anyhow!("download dispatcher panicked: {e}"))?;
-
     Ok(())
 }
 
@@ -258,6 +265,7 @@ fn main() {
     let args = Args::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.threads + 2)
         .enable_io()
         .enable_time()
         .build()
